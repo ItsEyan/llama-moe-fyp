@@ -1,12 +1,16 @@
-import warnings
+import warnings, logging
 
 import torch
 from deepspeed.moe.sharded_moe import gumbel_rsample
 from torch import nn
 from torch.distributions.normal import Normal
 
+logging.basicConfig(filename="topp_debug.txt", level=logging.INFO, filemode="w")
+
 valid_gate_type = ("linear", "mlp")
 
+from collections import Counter
+global_hist = Counter()
 
 def get_gate_network(gate_type, input_size, num_experts):
     gate_type = gate_type.lower()
@@ -226,6 +230,7 @@ class TopKBalancedNoisyGate(BaseGate):
     ):
         super(TopKBalancedNoisyGate, self).__init__()
         assert num_selects <= num_experts  # 选择数量大于专家数量，报错
+        print(f"Initializing TopKBalancedNoisyGate with num_selects={num_selects}, num_experts={num_experts}")
         self.input_size = input_size
         self.num_experts = num_experts
         self.num_selects = num_selects
@@ -235,7 +240,6 @@ class TopKBalancedNoisyGate(BaseGate):
 
         self.use_softmax = use_softmax
         self.softmax = nn.Softmax(1)
-
         self.use_balance = use_balance
         self.balance_loss_weight = balance_loss_weight
 
@@ -485,3 +489,348 @@ class SwitchBalancedGate(BaseGate):
             "load": load_mean,
             "importance": importance_mean,
         }
+    
+
+class DynamicTopGate(nn.Module):
+    """
+    Dynamic expert selection with a selectable strategy and a band clamp
+    around `num_selects`, i.e., k in [num_selects - k_band, num_selects + k_band]
+    intersected with [k_min, k_max].
+
+    Strategies: "topk" | "topp" | "threshold" | "entropy_k" | "budget"
+    Always returns fixed shapes for dispatcher compatibility.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        num_experts: int,
+        num_selects: int = 2,                 # nominal k
+        select_strategy: str = "topp",        # topp | threshold | entropy_k | budget | topk
+        k_min: int = 1,
+        k_max: int = 8,
+        p_min: float = 0.92,                  # nucleus threshold (topp)
+        tau: float = 0.02,                    # prob threshold (threshold)
+        target_k: float = 2.0,                # budget target
+        budget_weight: float = 5e-2,          # pull mean(k) toward target_k
+        gate_network: str = "mlp",
+        use_softmax: bool = True,
+        use_balance: bool = True,
+        balance_loss_weight: float = 1e-2,
+        add_noise: bool = True,
+        noise_epsilon: float = 1e-2,
+        # NEW: shaping & banding
+        logit_temperature: float = 0.7,       # <1 => sharper => tends to reduce k
+        k_band: int = 1,                      # bind k to [num_selects - k_band, num_selects + k_band]
+        # optional overuse regularizer (k > num_selects)
+        overuse_penalty_weight: float = 1e-2,
+        overuse_penalty_p: float = 1.0,
+    ):
+        super().__init__()
+        assert 1 <= k_min <= k_max <= num_experts
+        self.input_size = input_size
+        self.num_experts = num_experts
+        self.num_selects = num_selects
+
+        self.select_strategy = select_strategy.lower()
+        self.k_min = k_min
+        self.k_max = k_max
+        self.k_band = max(0, int(k_band))
+        self.debug_samples = 5  # number of samples to show in debug printouts
+
+        self.p_min = p_min
+        self.tau = tau
+        self.target_k = target_k
+        self.budget_weight = budget_weight
+
+        self.gate_network_type = gate_network
+        self.gate_network = get_gate_network(gate_network, input_size, num_experts)
+
+        self.use_softmax = use_softmax
+        self.softmax = nn.Softmax(dim=1)
+        self.use_balance = use_balance
+        self.balance_loss_weight = balance_loss_weight
+
+        self.add_noise = add_noise
+        self.noise_epsilon = noise_epsilon
+        self.warned = False
+
+        self.logit_temperature = logit_temperature
+        self.overuse_penalty_weight = overuse_penalty_weight
+        self.overuse_penalty_p = overuse_penalty_p
+
+        self.register_buffer("p_min_buf", torch.tensor(self.p_min), persistent=False)
+        self.pmin_lr = 1e-3
+        self.target_k = 2.1
+        self.pmin_bounds = (0.45, 0.85)
+
+        if self.add_noise:
+            self.weight_noise = nn.Linear(input_size, num_experts, bias=False)
+            self.normal = Normal(0.0, 1.0)
+            self.softplus = nn.Softplus()
+
+        if self.select_strategy == "budget":
+            # learnable global threshold for budget strategy
+            self.lambda_param = nn.Parameter(torch.tensor(0.0))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.add_noise:
+            nn.init.zeros_(self.weight_noise.weight)
+
+    @staticmethod
+    def cv_squared(x, eps=1e-10):
+        if x.shape[0] == 1:
+            return torch.tensor(0.0, device=x.device)
+        return x.float().var() / (x.float().mean() ** 2 + eps)
+
+    def _apply_noise(self, x, logits_gate):
+        if self.training and self.add_noise:
+            noise_mm = self.weight_noise(x)
+            noise_control = self.softplus(noise_mm) + self.noise_epsilon
+            logits_noise = torch.randn_like(logits_gate) * noise_control
+            logits = logits_gate + logits_noise
+        else:
+            noise_control, logits_noise, logits = None, None, logits_gate
+        return logits, logits_noise, noise_control
+
+    def _temper(self, logits):
+        T = self.logit_temperature
+        return logits if (T is None or T == 1.0) else (logits / T)
+
+    def _band_clamp(self, k_vec: torch.Tensor) -> torch.Tensor:
+        # clamp k to intersection of [k_min, k_max] and [num_selects - k_band, num_selects + k_band]
+        lower = max(self.k_min, self.num_selects - self.k_band)
+        upper = min(self.k_max, self.num_selects + self.k_band)
+        return torch.clamp(k_vec, min=lower, max=upper)
+
+    def _print_topp_debug(self, top_probs, k_vec):
+        import logging
+        B, E = top_probs.shape
+
+        p1 = top_probs[:, 0]
+        p2 = top_probs[:, 1] if E > 1 else torch.zeros_like(p1)
+        p3 = top_probs[:, 2] if E > 2 else torch.zeros_like(p1)
+        cum = torch.cumsum(top_probs, dim=1)
+        p_at_1 = p1
+        p_at_2 = cum[:, 1] if E > 1 else p1
+
+        gap12 = p1 - p2
+        gap23 = p2 - p3
+
+        def q(x):
+            x_f = x.float()
+            qs = torch.tensor([0.1, 0.5, 0.9], device=x.device, dtype=torch.float)
+            return torch.quantile(x_f, qs).tolist()
+
+        logging.info(
+            f"[DynamicTopGate][topp] p_min={self.p_min:.3f} | T={self.logit_temperature} "
+            f"| band=[{self.num_selects-self.k_band},{self.num_selects+self.k_band}]"
+        )
+        logging.info(
+            f"  k_vec mean={float(k_vec.float().mean()):.3f} "
+            f"std={float(k_vec.float().std(unbiased=False)):.3f}"
+        )
+        logging.info(
+            f"  p1   mean/min/max: {float(p1.mean()):.6f} {float(p1.min()):.6f} {float(p1.max()):.6f}  "
+            f"quantiles@0.1,0.5,0.9: {[round(v,4) for v in q(p1)]}"
+        )
+        logging.info(
+            f"  p2   mean/min/max: {float(p2.mean()):.6f} {float(p2.min()):.6f} {float(p2.max()):.6f}  "
+            f"quantiles@0.1,0.5,0.9: {[round(v,4) for v in q(p2)]}"
+        )
+        logging.info(
+            f"  p3   mean/min/max: {float(p3.mean()):.6f} {float(p3.min()):.6f} {float(p3.max()):.6f}  "
+            f"quantiles@0.1,0.5,0.9: {[round(v,4) for v in q(p3)]}"
+        )
+        logging.info(
+            f"  p@1  mean/min/max: {float(p_at_1.mean()):.6f} {float(p_at_1.min()):.6f} {float(p_at_1.max()):.6f}  "
+            f"quantiles: {[round(v,4) for v in q(p_at_1)]}"
+        )
+        logging.info(
+            f"  p@2  mean/min/max: {float(p_at_2.mean()):.6f} {float(p_at_2.min()):.6f} {float(p_at_2.max()):.6f}  "
+            f"quantiles: {[round(v,4) for v in q(p_at_2)]}"
+        )
+        logging.info(
+            f"  gap12 mean/min/max: {float(gap12.mean()):.6f} {float(gap12.min()):.6f} {float(gap12.max()):.6f}  "
+            f"quantiles: {[round(v,4) for v in q(gap12)]}"
+        )
+        logging.info(
+            f"  gap23 mean/min/max: {float(gap23.mean()):.6f} {float(gap23.min()):.6f} {float(gap23.max()):.6f}  "
+            f"quantiles: {[round(v,4) for v in q(gap23)]}"
+        )
+
+        # histogram of chosen k
+        binc_max = int(self.k_max) + 1
+        hist = torch.bincount(k_vec, minlength=binc_max)[:binc_max].tolist()
+
+        # add to global histogram
+        global global_hist
+        global_hist.update({i: hist[i] for i in range(len(hist))})
+
+        logging.info(f"  k_vec hist (0..{self.k_max}): {hist}")
+
+        # show a few rows of top-5 probs and cum up to 5
+        show = min(self.debug_samples, B)
+        tp5 = top_probs[:show, : min(5, E)]
+        cum5 = torch.cumsum(tp5, dim=1)
+        for i in range(show):
+            row_p = [round(float(v), 4) for v in tp5[i]]
+            row_c = [round(float(v), 4) for v in cum5[i]]
+            logging.info(f"  ex[{i}] top5 p: {row_p} | cum: {row_c} | k={int(k_vec[i].item())}")
+
+
+    def _dynamic_select(self, logits):
+        """
+        Returns:
+            top_indices [B, Kmax], top_scores [B, Kmax], top_mask [B, Kmax], k_vec [B]
+        """
+        B, E = logits.shape
+        device = logits.device
+
+        # sort once
+        top_vals, top_idx = logits.sort(dim=1, descending=True)  # [B,E]
+        top_probs = self.softmax(top_vals) if self.use_softmax else top_vals
+
+        # choose k based on strategy
+        if self.select_strategy == "topk":
+            k_vec = torch.full((B,), self.num_selects, device=device, dtype=torch.long)
+
+        elif self.select_strategy == "topp":
+            top_probs = torch.softmax(top_vals, dim=1) if self.use_softmax else top_vals
+            cum = torch.cumsum(top_probs, dim=1)
+
+            reached = (cum >= self.p_min)
+            idx_first_true = torch.where(
+                reached.any(dim=1),
+                reached.float().argmax(dim=1),
+                torch.full((logits.size(0),), cum.size(1) - 1, device=logits.device)
+            )
+            k_vec = (idx_first_true + 1).to(torch.long)  # 1-based
+
+            # --- early-exit for confident top-1 ---
+            p1 = top_probs[:, 0]
+            p2 = top_probs[:, 1] if top_probs.size(1) > 1 else torch.zeros_like(p1)
+            p3 = top_probs[:, 2] if top_probs.size(1) > 2 else torch.zeros_like(p1)
+            gap12 = p1 - p2
+            gap23 = p2 - p3
+
+            confident_1 = (p1 >= 0.46) & (gap12 >= 0.10)
+            k_vec = torch.where(confident_1, torch.ones_like(k_vec), k_vec)
+
+            # --- demote 3→2 when third expert gives low marginal benefit ---
+            k3 = (k_vec > 2)
+            close_delta = 0.10
+            k2_close = (cum[:, 1] >= (self.p_min - close_delta))
+            p3_small = (p3 <= 0.12)
+            low_gain = (gap23 <= 0.03)
+            demote_3_to_2 = k3 & (k2_close | p3_small | low_gain)
+            k_vec = torch.where(demote_3_to_2, torch.full_like(k_vec, 2), k_vec)
+
+            # (adaptive p_min update continues below)
+            with torch.no_grad():
+                mean_k = k_vec.float().mean()
+                self.p_min_buf -= self.pmin_lr * (mean_k - self.target_k)
+                self.p_min_buf.clamp_(*self.pmin_bounds)
+            self.p_min = float(self.p_min_buf.item())
+   
+        elif self.select_strategy == "threshold":
+            p = self.softmax(logits) if self.use_softmax else logits
+            k_counts = (p >= self.tau).sum(dim=1)
+            k_vec = k_counts.to(torch.long)
+
+        elif self.select_strategy == "entropy_k":
+            p = self.softmax(logits) if self.use_softmax else torch.softmax(logits, dim=1)
+            H = -(p * p.clamp_min(1e-12).log()).sum(dim=1)
+            H_norm = H / torch.log(torch.tensor(self.num_experts, device=device, dtype=p.dtype))
+            k_float = self.k_min + (self.k_max - self.k_min) * H_norm
+            k_vec = k_float.round().to(torch.long)
+
+        elif self.select_strategy == "budget":
+            tau = torch.sigmoid(self.lambda_param)
+            p = self.softmax(logits) if self.use_softmax else logits
+            k_counts = (p >= tau).sum(dim=1)
+            k_vec = k_counts.to(torch.long)
+
+        else:
+            raise ValueError(f"Unknown strategy {self.select_strategy}")
+
+        # band clamp around num_selects
+        k_vec = self._band_clamp(k_vec)
+
+        # Build fixed outputs up to Kmax
+        Kmax = int(self.k_max)
+        pos = torch.arange(Kmax, device=device).unsqueeze(0).expand(B, Kmax)
+        k_exp = k_vec.unsqueeze(1)
+        top_mask = (pos < k_exp).to(logits.dtype)  # [B,Kmax] {0,1}
+
+        top_indices = top_idx[:, :Kmax]
+        top_scores = top_probs[:, :Kmax] * top_mask
+
+        last_valid = torch.clamp(k_vec - 1, min=0)
+        pad_fill = top_indices.gather(1, last_valid.unsqueeze(1).expand(B, Kmax))
+        top_indices = torch.where(top_mask.bool(), top_indices, pad_fill)
+        # logging.info(f"DynamicTopGate forward: {self.select_strategy}, k_vec: {k_vec.tolist()}, top_indices[0]: {top_indices[0].tolist()}")
+        self._print_topp_debug(top_probs.detach(), k_vec.detach())
+
+        return top_indices, top_scores, top_mask, k_vec
+
+    def forward(self, x):
+        logits_gate = self.gate_network(x)                       # [B,E]
+        logits, logits_noise, noise_control = self._apply_noise(x, logits_gate)
+        logits_t = self._temper(logits)                          # temperature before selection
+
+        top_indices, top_scores, top_mask, k_vec = self._dynamic_select(logits_t)
+
+        # importance/load
+        B, E = logits.shape
+        zeros = torch.zeros_like(logits, requires_grad=True, device=logits.device)
+        scores_filtered = zeros.scatter(dim=1, index=top_indices, src=top_scores)
+        importance = scores_filtered.sum(0)
+
+        if self.training and self.add_noise and self.select_strategy == "topk" and self.num_selects != self.num_experts:
+            # differentiable load only for noisy fixed-k case
+            batch_size = logits.shape[0]
+            m = min(self.num_selects + 1, self.num_experts)
+            top_logits, _ = logits.topk(m, dim=1)
+            top_values_flat = top_logits.flatten()
+            tpos_in = torch.arange(batch_size, device=x.device) * m + self.num_selects
+            thr_in = torch.gather(top_values_flat, 0, tpos_in).unsqueeze(1)
+            tpos_out = tpos_in - 1
+            thr_out = torch.gather(top_values_flat, 0, tpos_out).unsqueeze(1)
+            is_in = torch.gt(logits_noise, thr_in)
+            prob_if_in = self.normal.cdf((logits_gate - thr_in) / noise_control)
+            prob_if_out = self.normal.cdf((logits_gate - thr_out) / noise_control)
+            prob = torch.where(is_in, prob_if_in, prob_if_out)
+            load = prob.sum(0)
+        else:
+            load = (scores_filtered > 0).sum(0)
+
+        # balance loss
+        if self.use_balance:
+            balance_loss = (self.cv_squared(importance) + self.cv_squared(load)) * self.balance_loss_weight
+        else:
+            balance_loss = torch.tensor(0.0, device=x.device)
+
+        out = {
+            "topK_indices": top_indices,     # [B, Kmax]
+            "topK_scores": top_scores,       # [B, Kmax]
+            "topK_mask": top_mask,           # [B, Kmax]
+            "importance": importance,        # [E]
+            "load": load,                    # [E]
+            "balance_loss": balance_loss,    # scalar
+            "k_vec": k_vec                   # [B]
+        }
+
+        # optional budget loss
+        if self.select_strategy == "budget":
+            mean_k = k_vec.float().mean()
+            out["budget_loss"] = (mean_k - self.target_k).pow(2) * self.budget_weight
+
+        # optional overuse regularizer (only penalize k > num_selects)
+        if self.overuse_penalty_weight > 0 and self.select_strategy in {"topp","threshold","entropy_k","budget"}:
+            over = (k_vec.float() - float(self.num_selects)).clamp_min(0.0)
+            out["overuse_loss"] = over.pow(self.overuse_penalty_p).mean() * self.overuse_penalty_weight
+
+        return out

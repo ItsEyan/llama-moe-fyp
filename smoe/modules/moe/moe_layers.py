@@ -20,6 +20,7 @@ from .moe_gates import (
     TopKBalancedNoisyGate,
     UniformLearnableGate,
     UniformPlainGate,
+    DynamicTopGate,
 )
 
 
@@ -104,6 +105,19 @@ class BaseMoELayer(nn.Module):
                 balance_loss_weight=kwargs.get("gate_balance_loss_weight", 1e-2),
                 add_noise=kwargs.get("gate_add_noise", True),
             )
+        elif self.gate_type == "DynamicTopGate":  # dynamic top-k gate
+            self.gate = DynamicTopGate(
+                input_size=self.input_size,
+                num_experts=self.num_experts,
+                num_selects=2,
+                k_min=1, k_max=8,
+                k_band=1,                # ⇒ k in {1,2,3}
+                select_strategy="topp",
+                p_min=0.52,              # forgiving
+                logit_temperature=0.5,   # slightly softer than 0.8
+                use_softmax=True
+            )
+
         else:
             raise NotImplementedError
 
