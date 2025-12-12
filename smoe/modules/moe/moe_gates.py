@@ -230,7 +230,6 @@ class TopKBalancedNoisyGate(BaseGate):
     ):
         super(TopKBalancedNoisyGate, self).__init__()
         assert num_selects <= num_experts  # 选择数量大于专家数量，报错
-        print(f"Initializing TopKBalancedNoisyGate with num_selects={num_selects}, num_experts={num_experts}")
         self.input_size = input_size
         self.num_experts = num_experts
         self.num_selects = num_selects
@@ -689,53 +688,73 @@ class DynamicTopGate(nn.Module):
         B, E = logits.shape
         device = logits.device
 
-        # sort once
-        top_vals, top_idx = logits.sort(dim=1, descending=True)  # [B,E]
+        # Upper bound of the band around num_selects
+        Kband_hi = min(self.k_max, self.num_selects + self.k_band)
+        Kband_hi = max(1, Kband_hi)  # safety
+
+        # Get only the top-Kband_hi experts once (cheaper than full sort)
+        # top_vals, top_idx are sorted in descending order by construction
+        top_vals, top_idx = logits.topk(Kband_hi, dim=1)  # [B, Kband_hi]
         top_probs = self.softmax(top_vals) if self.use_softmax else top_vals
 
-        # choose k based on strategy
+        # ---- Choose k based on strategy ----
         if self.select_strategy == "topk":
+            # fixed-k
             k_vec = torch.full((B,), self.num_selects, device=device, dtype=torch.long)
 
         elif self.select_strategy == "topp":
-            top_probs = torch.softmax(top_vals, dim=1) if self.use_softmax else top_vals
-            cum = torch.cumsum(top_probs, dim=1)
-
+            # nucleus-like selection within the band
+            cum = torch.cumsum(top_probs, dim=1)  # [B, Kband_hi]
             reached = (cum >= self.p_min)
+
+            # Fallback index if row never reaches p_min (shouldn't really happen with softmax)
+            default_idx = torch.full(
+                (B,), Kband_hi - 1, device=device, dtype=torch.long
+            )
+
             idx_first_true = torch.where(
                 reached.any(dim=1),
                 reached.float().argmax(dim=1),
-                torch.full((logits.size(0),), cum.size(1) - 1, device=logits.device)
+                default_idx
             )
-            k_vec = (idx_first_true + 1).to(torch.long)  # 1-based
+            # k is 1-based
+            k_vec = (idx_first_true + 1).to(torch.long)  # [B]
 
-            # --- early-exit for confident top-1 ---
+            # --- confidence heuristics (still within band) ---
             p1 = top_probs[:, 0]
-            p2 = top_probs[:, 1] if top_probs.size(1) > 1 else torch.zeros_like(p1)
-            p3 = top_probs[:, 2] if top_probs.size(1) > 2 else torch.zeros_like(p1)
+            p2 = top_probs[:, 1] if Kband_hi > 1 else torch.zeros_like(p1)
+            p3 = top_probs[:, 2] if Kband_hi > 2 else torch.zeros_like(p1)
             gap12 = p1 - p2
             gap23 = p2 - p3
 
+            # confident top-1 → force k=1
             confident_1 = (p1 >= 0.46) & (gap12 >= 0.10)
             k_vec = torch.where(confident_1, torch.ones_like(k_vec), k_vec)
 
-            # --- demote 3→2 when third expert gives low marginal benefit ---
+            # demote 3→2 when marginal benefit of 3rd expert is low
+            if Kband_hi > 2:
+                cum2 = cum[:, 1]  # cumulative mass of top-2
+            else:
+                cum2 = p1
+
             k3 = (k_vec > 2)
             close_delta = 0.10
-            k2_close = (cum[:, 1] >= (self.p_min - close_delta))
+            k2_close = (cum2 >= (self.p_min - close_delta))
             p3_small = (p3 <= 0.12)
             low_gain = (gap23 <= 0.03)
             demote_3_to_2 = k3 & (k2_close | p3_small | low_gain)
             k_vec = torch.where(demote_3_to_2, torch.full_like(k_vec, 2), k_vec)
 
-            # (adaptive p_min update continues below)
-            with torch.no_grad():
-                mean_k = k_vec.float().mean()
-                self.p_min_buf -= self.pmin_lr * (mean_k - self.target_k)
-                self.p_min_buf.clamp_(*self.pmin_bounds)
-            self.p_min = float(self.p_min_buf.item())
-   
+            # Online adaptation of p_min only during training
+            if self.training:
+                with torch.no_grad():
+                    mean_k = k_vec.float().mean()
+                    self.p_min_buf -= self.pmin_lr * (mean_k - self.target_k)
+                    self.p_min_buf.clamp_(*self.pmin_bounds)
+                self.p_min = float(self.p_min_buf.item())
+
         elif self.select_strategy == "threshold":
+            # threshold on full probabilities (not just within band)
             p = self.softmax(logits) if self.use_softmax else logits
             k_counts = (p >= self.tau).sum(dim=1)
             k_vec = k_counts.to(torch.long)
@@ -744,10 +763,24 @@ class DynamicTopGate(nn.Module):
             p = self.softmax(logits) if self.use_softmax else torch.softmax(logits, dim=1)
             H = -(p * p.clamp_min(1e-12).log()).sum(dim=1)
             H_norm = H / torch.log(torch.tensor(self.num_experts, device=device, dtype=p.dtype))
-            k_float = self.k_min + (self.k_max - self.k_min) * H_norm
+
+            # Map entropy to a *small* k range
+            # k_low = self.k_min              # e.g. 1
+            # k_high = self.num_selects       # e.g. 4
+            # k_float = k_low + (k_high - k_low) * H_norm
+            # k_vec = k_float.round().to(torch.long)
+            alpha = 2.0   # >1 → biases toward low k
+            H_scaled = H_norm.pow(alpha)
+
+            k_low = self.k_min
+            k_high = self.num_selects  # 4
+
+            k_float = k_low + (k_high - k_low) * H_scaled
             k_vec = k_float.round().to(torch.long)
 
+
         elif self.select_strategy == "budget":
+            # global learnable threshold
             tau = torch.sigmoid(self.lambda_param)
             p = self.softmax(logits) if self.use_softmax else logits
             k_counts = (p >= tau).sum(dim=1)
@@ -756,25 +789,29 @@ class DynamicTopGate(nn.Module):
         else:
             raise ValueError(f"Unknown strategy {self.select_strategy}")
 
-        # band clamp around num_selects
-        k_vec = self._band_clamp(k_vec)
+        # ---- Band clamp k around num_selects and within [k_min, k_max] ----
+        k_vec = self._band_clamp(k_vec)  # [B]
 
-        # Build fixed outputs up to Kmax
-        Kmax = int(self.k_max)
-        pos = torch.arange(Kmax, device=device).unsqueeze(0).expand(B, Kmax)
-        k_exp = k_vec.unsqueeze(1)
-        top_mask = (pos < k_exp).to(logits.dtype)  # [B,Kmax] {0,1}
+        # ---- Build fixed-size outputs up to Kmax = Kband_hi ----
+        Kmax = Kband_hi
+        pos = torch.arange(Kmax, device=device).unsqueeze(0).expand(B, Kmax)  # [B,Kmax]
+        k_exp = k_vec.unsqueeze(1)                                            # [B,1]
 
-        top_indices = top_idx[:, :Kmax]
-        top_scores = top_probs[:, :Kmax] * top_mask
+        top_mask = (pos < k_exp).to(logits.dtype)     # [B,Kmax] {0,1}
+        top_indices = top_idx[:, :Kmax]               # [B,Kmax]
+        top_scores = top_probs[:, :Kmax] * top_mask   # [B,Kmax]
 
-        last_valid = torch.clamp(k_vec - 1, min=0)
-        pad_fill = top_indices.gather(1, last_valid.unsqueeze(1).expand(B, Kmax))
+        # For masked-out positions, pad indices with the last valid index in that row
+        last_valid = torch.clamp(k_vec - 1, min=0)    # [B]
+        pad_fill = top_indices.gather(
+            1, last_valid.unsqueeze(1).expand(B, Kmax)
+        )                                             # [B,Kmax]
         top_indices = torch.where(top_mask.bool(), top_indices, pad_fill)
-        # logging.info(f"DynamicTopGate forward: {self.select_strategy}, k_vec: {k_vec.tolist()}, top_indices[0]: {top_indices[0].tolist()}")
+
         self._print_topp_debug(top_probs.detach(), k_vec.detach())
 
         return top_indices, top_scores, top_mask, k_vec
+
 
     def forward(self, x):
         logits_gate = self.gate_network(x)                       # [B,E]
@@ -785,7 +822,7 @@ class DynamicTopGate(nn.Module):
 
         # importance/load
         B, E = logits.shape
-        zeros = torch.zeros_like(logits, requires_grad=True, device=logits.device)
+        zeros = torch.zeros_like(logits, requires_grad=False, device=logits.device)
         scores_filtered = zeros.scatter(dim=1, index=top_indices, src=top_scores)
         importance = scores_filtered.sum(0)
 

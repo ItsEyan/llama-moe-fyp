@@ -85,58 +85,106 @@ class UniversalCalculator(BaseCalculator):
             self.mlp_norm.reset_parameters()
 
     def forward(
-        self, x, topK_indices, topK_scores, expert_batch_size=None, **kwargs
+        self,
+        x,
+        topK_indices,
+        topK_scores,
+        expert_batch_size=None,
+        topK_mask=None,
+        **kwargs,
     ) -> CalculatorOutput:
         # fmt: off
-        """正向传播"""
-        """临时变量"""
-        batch_size = topK_indices.size(0)  # topK_indices: (bsz*seq_len, num_selects)
-        num_selects = topK_indices.size(1)
-        topK_indices = topK_indices.flatten()  # shape(batch_size*num_selects)
-        topK_scores = topK_scores.flatten()  # shape(batch_size*num_selects)
-        # 选出的专家编号所对应的batch编号，shape(batch_size*num_selects)
-        # repeat_interleave(repeats=2): [1,2,3] -> [1,1,2,2,3,3]
-        batch_indices = torch.arange(batch_size, device=topK_scores.device).repeat_interleave(num_selects)
+        """
+        Forward pass for top-k / dynamic-k MoE.
 
-        """按照专家序号从小到大的顺序，生成专家索引"""
-        # index_sorted_topK_indices: (token_num*num_selects)
-        _, index_sorted_topK_indices = topK_indices.sort(0)
+        Args:
+            x:             (num_tokens, hidden_size)
+            topK_indices:  (num_tokens, Kmax) expert indices per token-slot
+            topK_scores:   (num_tokens, Kmax) gate scores per token-slot
+            topK_mask:     (num_tokens, Kmax) mask in {0,1} or bool; 1 = active slot.
+                            - If None: assume all slots active (backwards-compatible).
+        """
+        device = x.device
+        batch_size, num_selects = topK_indices.shape  # num_tokens, Kmax
 
-        """按照索引重新排列scores与batch_indices，并计算专家的batch_size"""
-        sorted_topK_scores = topK_scores.index_select(0, index_sorted_topK_indices)  # 各个输出对应的权重
-        sorted_batch_indices = batch_indices.index_select(0, index_sorted_topK_indices)  # 各个专家对应的一个batch里所有token的编号
+        # ---- Build flat lists of (expert_idx, token_idx, score) ----
+        if topK_mask is not None:
+            # Use only masked (active) slots
+            # topK_mask can be float or bool; treat >0 as True.
+            active = topK_mask > 0
+            # (N_active,)
+            flat_expert_idx = topK_indices[active].reshape(-1)
+            flat_scores     = topK_scores[active].reshape(-1)
 
+            # Build a (batch_size, num_selects) grid of token indices and mask it
+            token_grid = torch.arange(batch_size, device=device).unsqueeze(1).expand(batch_size, num_selects)
+            flat_token_idx = token_grid[active].reshape(-1)
+        else:
+            # Original behavior: every slot is active
+            flat_expert_idx = topK_indices.reshape(-1)   # (batch_size * num_selects,)
+            flat_scores     = topK_scores.reshape(-1)    # (batch_size * num_selects,)
+            flat_token_idx  = torch.arange(batch_size, device=device).repeat_interleave(num_selects)
+
+        # Sanity: there should always be at least one active slot per token
+        # given k_min >= 1 in the gate; so flat_expert_idx should be non-empty.
+        # ---- Sort by expert index so that each expert sees a contiguous chunk ----
+        _, index_sorted = flat_expert_idx.sort(0)
+        sorted_expert_idx  = flat_expert_idx.index_select(0, index_sorted)   # (N_active,)
+        sorted_scores      = flat_scores.index_select(0, index_sorted)       # (N_active,)
+        sorted_token_idx   = flat_token_idx.index_select(0, index_sorted)    # (N_active,)
+
+        # ---- Compute per-expert batch sizes ----
         if expert_batch_size is None:
-            expert_batch_size = topK_indices.bincount(minlength=self.num_experts).tolist()  # 各个专家对应的batch_size
-            # if len(expert_batch_size) < self.num_experts:  # 列表长度不足专家数，说明 被选择的最大专家序号 小于 所有专家中的最大专家序号
-            #     expert_batch_size.extend([0] * (self.num_experts - len(expert_batch_size)))  # 使用0补全列表
+            # bincount over expert index; length = num_experts
+            expert_batch_size = sorted_expert_idx.bincount(minlength=self.num_experts).tolist()
 
-        """对每个专家重新组合batch"""
-        sorted_x = x.index_select(0, sorted_batch_indices)  # 将输入按照排序后的batch编号，重新编制
-        split_x = torch.split(sorted_x, expert_batch_size, dim=0)  # 按照排序后每个专家的batch_size进行分隔，恰好得到各个专家所需的batch
+        # ---- Rebatch inputs by expert ----
+        # Gather tokens in sorted (by expert) order
+        sorted_x = x.index_select(0, sorted_token_idx)           # (N_active, hidden_size)
+        # Split them into per-expert chunks according to expert_batch_size
+        split_x = torch.split(sorted_x, expert_batch_size, dim=0)
 
-        """各专家分别正向传播"""  # 此处应该有并行优化的空间 (如果单次forward不足以占满显卡利用率)
-        # args = [(split_x[i], i) for i in range(self.num_experts) if split_x[i].shape[0] > 0]
-        # expert_outputs = self.experts_vmap(args)
-        expert_outputs = [self.experts(split_x[i], i) for i in range(self.num_experts) if split_x[i].shape[0] > 0]
+        # ---- Run each expert on its chunk ----
+        expert_outputs = []
+        for i in range(self.num_experts):
+            chunk = split_x[i]
+            if chunk.shape[0] == 0:
+                continue
+            out_i = self.experts(chunk, i)
+            expert_outputs.append(out_i)
 
-        """重组各个专家的输出，并进行加权"""
-        # (bsz*seq_len*num_selects, hidden_size)
-        cat_expert_outputs = torch.cat(expert_outputs, 0)  # 拼接专家输出
+        # Concatenate outputs back in the same order as sorted_x
+        cat_expert_outputs = torch.cat(expert_outputs, dim=0)    # (N_active, hidden_dim)
         output_dim = cat_expert_outputs.size(1)
+
+        # ---- Apply gate scores ----
         if self.multiply_gate_scores:
             if self.mlp_norm is None:
-                cat_expert_outputs = torch.mul(cat_expert_outputs, sorted_topK_scores.reshape(-1, 1) * self.score_scale_factor)  # 乘权重
-                # cat_expert_outputs = torch.mul(cat_expert_outputs, sorted_topK_scores.reshape(-1, 1) * 1.0)  # 乘权重
+                cat_expert_outputs = torch.mul(
+                    cat_expert_outputs,
+                    sorted_scores.reshape(-1, 1) * self.score_scale_factor,
+                )
             else:
-                cat_expert_outputs = torch.mul(cat_expert_outputs, sorted_topK_scores.reshape(-1, 1))  # 乘权重
+                cat_expert_outputs = torch.mul(
+                    cat_expert_outputs,
+                    sorted_scores.reshape(-1, 1),
+                )
                 cat_expert_outputs = self.mlp_norm(cat_expert_outputs)
 
-        zeros = torch.zeros((batch_size, output_dim), device=cat_expert_outputs.device, dtype=cat_expert_outputs.dtype)
-        y = zeros.index_add(0, sorted_batch_indices, cat_expert_outputs)  # 按照对应的batch编号，添加输出
+        # ---- Scatter-add back to token positions ----
+        zeros = torch.zeros(
+            (batch_size, output_dim),
+            device=cat_expert_outputs.device,
+            dtype=cat_expert_outputs.dtype,
+        )
+        y = zeros.index_add(0, sorted_token_idx, cat_expert_outputs)
 
-        return CalculatorOutput(hidden_states=y, num_dropped_tokens=torch.tensor(-1.0))
+        return CalculatorOutput(
+            hidden_states=y,
+            num_dropped_tokens=torch.tensor(-1.0, device=device),
+        )
         # fmt: on
+
 
 
 class SwitchDropTokenCalculator(BaseCalculator):

@@ -40,6 +40,12 @@ class LlamaMoEConfig(PretrainedConfig):
         gate_add_noise=True,
         # TopKBalancedNoisyGate
         gate_noise_epsilon=1e-2,
+        k_min=0,
+        k_max=7,
+        k_band=1,
+        select_strategy="entropy",
+        p_min=0.45,
+        logit_temperature=0.6,
         # -------- moe calculator configs --------
         calculator_type="UniversalCalculator",
         multiply_gate_scores=True,
@@ -79,6 +85,12 @@ class LlamaMoEConfig(PretrainedConfig):
         self.gate_balance_loss_weight = gate_balance_loss_weight
         self.gate_add_noise = gate_add_noise
         self.gate_noise_epsilon = gate_noise_epsilon
+        self.k_min = k_min
+        self.k_max = k_max
+        self.k_band = k_band
+        self.select_strategy = select_strategy
+        self.p_min = p_min
+        self.logit_temperature = logit_temperature
 
         self.calculator_type = calculator_type
         self.multiply_gate_scores = multiply_gate_scores

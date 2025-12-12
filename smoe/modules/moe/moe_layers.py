@@ -109,13 +109,14 @@ class BaseMoELayer(nn.Module):
             self.gate = DynamicTopGate(
                 input_size=self.input_size,
                 num_experts=self.num_experts,
-                num_selects=2,
-                k_min=1, k_max=8,
-                k_band=1,                # ⇒ k in {1,2,3}
-                select_strategy="topp",
-                p_min=0.52,              # forgiving
-                logit_temperature=0.5,   # slightly softer than 0.8
-                use_softmax=True
+                num_selects=self.num_selects,
+                k_min=kwargs.get("k_min", 1),
+                k_max=kwargs.get("k_max", 8),
+                k_band=kwargs.get("k_band", 2),
+                select_strategy=kwargs.get("select_strategy", "topp"),
+                p_min=kwargs.get("p_min", 0.42),
+                logit_temperature=kwargs.get("logit_temperature", 0.5),
+                use_softmax=kwargs.get("gate_use_softmax", True),
             )
 
         else:
