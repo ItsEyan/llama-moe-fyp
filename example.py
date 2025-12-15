@@ -92,13 +92,51 @@ if getattr(model.config, "gate_type", "") == "DynamicTopGate":
     print("select_strategy:", model.config.select_strategy)
     print("p_min:", model.config.p_min)
     print("logit_temperature:", model.config.logit_temperature)
+    
+def evaluate(datasets):
+    if "boolq" in datasets:
+        eval_boolq(
+            model, tokenizer, device, integrate_gpu_energy_joules,
+            max_eval=1024, batch_size=8, max_new_tokens=3
+        )
+
+    if "piqa" in datasets:
+        # 2️⃣ PIQA (2-choice physical commonsense)
+        eval_piqa(
+            model, tokenizer, device, integrate_gpu_energy_joules,
+            max_eval=2000, batch_size=32
+        )
+
+    if "hellaswag" in datasets:
+        # 3️⃣ HellaSwag (4-choice adversarial completion)
+        eval_hellaswag(
+            model, tokenizer, device, integrate_gpu_energy_joules,
+            max_eval=2000, batch_size=8
+        )
+
+    if "arc" in datasets:
+        # 4️⃣ ARC-Challenge (multi-choice science)
+        eval_arc(
+            model, tokenizer, device, integrate_gpu_energy_joules,
+            subset="ARC-Challenge", max_eval=1000, batch_size=8
+        )
+
+    if "lambada" in datasets:
+        # 5️⃣ LAMBADA (long-range next-word prediction)
+        eval_lambada(
+            model, tokenizer, device, integrate_gpu_energy_joules,
+            max_eval=5000, batch_size=32
+        )
 
 ########################################
 # Run
 ########################################
 if __name__ == "__main__":
-    # quick smoke test on 64 examples; bump to 3-5k for a fuller run
-    eval_boolq(
-        model, tokenizer, device, integrate_gpu_energy_joules,
-        max_eval=1024, batch_size=8, max_new_tokens=3
-    )
+    eval_datasets = [
+        # "boolq",
+        # "piqa",
+        # "hellaswag",
+        # "arc",
+        "lambada",
+    ]
+    evaluate(eval_datasets)
