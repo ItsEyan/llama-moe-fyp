@@ -30,10 +30,13 @@ def _report_energy(
     J_per_token_sup  = energy_J / max(1, res.supervised_tokens) if res.supervised_tokens else float("nan")
     Wh_per_1k_proc   = (Wh / max(1, res.processed_tokens)) * 1000.0 if res.processed_tokens else float("nan")
     Wh_per_1k_sup    = (Wh / max(1, res.supervised_tokens)) * 1000.0 if res.supervised_tokens else float("nan")
+    
+    J_per_example = energy_J / max(1, res.total) if res.total else float("nan")
 
     print("\n=== Evaluation Summary ===")
     print(f"{task_name} — N={res.total} | Acc: {acc*100:.2f}%")
     print(f"Time: {sec:.3f}s | Avg GPU Power: {avg_W:.1f} W | Energy: {energy_J:.1f} J ({Wh:.4f} Wh)")
+    print(f"Energy/example: {J_per_example:.3f} J")
     if res.generated_tokens:
         print(f"Generated tokens: {res.generated_tokens} | gen tok/s: {tokps_gen:.1f}")
     print(f"Processed tokens: {res.processed_tokens} | proc tok/s: {tokps_proc:.1f}")
@@ -50,7 +53,7 @@ def _report_energy(
             f"[FLOPs] Forward (first batch): {fi['total_flops_forward']/1e12:.3f} TFLOPs "
             f"(~{fi['flops_per_token_forward']:.0f} FLOPs/token over {fi['profiled_batch_tokens']} tokens)"
         )
-        approx_total_flops_eval = fi["flops_per_token_forward"] * max(1, res.generated_tokens or res.supervised_tokens)
+        approx_total_flops_eval = fi["flops_per_token_forward"] * max(1, res.processed_tokens)
         print(
             f"[FLOPs] Approx energy per 10¹² FLOPs (using new/supervised tokens): "
             f"{energy_J / max(1, approx_total_flops_eval / 1e12):.3f} J / TFLOP"
@@ -61,14 +64,27 @@ def _report_energy(
         from smoe.modules.moe.moe_gates import global_hist
     except Exception:
         global_hist = {}
+    
+    try:
+        from smoe.modules.moe.moe_gates import global_expert_hist
+    except Exception:
+        global_expert_hist = {}
 
     sorted_hist = dict(sorted(global_hist.items()))
     total_h = sum(sorted_hist.values())
     if sorted_hist:
-        print("\n=== Accumulated Expert Activation Histogram ===")
+        print("\n=== Accumulated k-per-token Histogram ===")
         for k, count in sorted_hist.items():
             pct = (count / total_h * 100.0) if total_h else 0.0
             print(f"k={k:>2d}: {count:>8d}  ({pct:.2f}%)")
+
+    sorted_ehist = dict(sorted(global_expert_hist.items()))
+    total_e = sum(sorted_ehist.values())
+    if sorted_ehist:
+        print("\n=== Accumulated Expert Activation Histogram ===")
+        for e, count in sorted_ehist.items():
+            pct = (count / total_e * 100.0) if total_e else 0.0
+            print(f"expert={e:>2d}: {count:>8d}  ({pct:.2f}%)")
 
 
 
@@ -281,23 +297,22 @@ def eval_boolq(model, tokenizer, device, integrate_gpu_energy_joules,
             prefixes = make_batch_prefixes(batch)
             enc_prefix = _pad_batch_texts(tokenizer, device, prefixes)  # dict with input_ids, attention_mask
 
-            # ----- FLOPs on first batch: forward-only on prefixes -----
-            if collect_flops and bi == 0:
-                _collect_flops_once(
-                    task_name="BoolQ",
-                    model=model,
-                    forward_kwargs={
-                        "input_ids": enc_prefix["input_ids"],
-                        "attention_mask": enc_prefix["attention_mask"],
-                    },
-                    flops_info=flops_info,
-                    sort_by="self_cuda_time_total",
-                )
-
             # ----- Two fixed verbalizers with leading space -----
             B = enc_prefix["input_ids"].size(0)
             sfx_yes = _pad_batch_texts(tokenizer, device, [" Yes"] * B)
             sfx_no  = _pad_batch_texts(tokenizer, device, [" No"]  * B)
+            
+            if collect_flops and bi == 0:
+                inp_full = torch.cat([enc_prefix["input_ids"], sfx_yes["input_ids"]], dim=1)
+                attn_full = torch.cat([enc_prefix["attention_mask"], torch.ones_like(sfx_yes["input_ids"], device=device)], dim=1)
+                _collect_flops_once(
+                    task_name="BoolQ (prefix+suffix)",
+                    model=model,
+                    forward_kwargs={"input_ids": inp_full, "attention_mask": attn_full},
+                    flops_info=flops_info,
+                    sort_by="self_cuda_time_total",
+                )
+
 
             # ----- Score suffixes: log p(" Yes" | prefix) vs log p(" No" | prefix) -----
             scores, pt, st = _sum_logprobs_for_suffix(

@@ -2,7 +2,6 @@
 import os, time, threading, sys
 from tqdm import tqdm
 import torch
-from smoe.modules.moe.moe_gates import global_hist
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pynvml import (nvmlInit, nvmlShutdown, nvmlDeviceGetHandleByIndex,
@@ -94,38 +93,39 @@ if getattr(model.config, "gate_type", "") == "DynamicTopGate":
     print("logit_temperature:", model.config.logit_temperature)
     
 def evaluate(datasets):
+    collect_flops = False
     if "boolq" in datasets:
         eval_boolq(
             model, tokenizer, device, integrate_gpu_energy_joules,
-            max_eval=1024, batch_size=8, max_new_tokens=3
+            max_eval=1024, batch_size=8, collect_flops=collect_flops
         )
 
     if "piqa" in datasets:
         # 2️⃣ PIQA (2-choice physical commonsense)
         eval_piqa(
             model, tokenizer, device, integrate_gpu_energy_joules,
-            max_eval=2000, batch_size=32
+            max_eval=2000, batch_size=32, collect_flops=collect_flops
         )
 
     if "hellaswag" in datasets:
         # 3️⃣ HellaSwag (4-choice adversarial completion)
         eval_hellaswag(
             model, tokenizer, device, integrate_gpu_energy_joules,
-            max_eval=2000, batch_size=8
+            max_eval=2000, batch_size=8, collect_flops=collect_flops
         )
 
     if "arc" in datasets:
         # 4️⃣ ARC-Challenge (multi-choice science)
         eval_arc(
             model, tokenizer, device, integrate_gpu_energy_joules,
-            subset="ARC-Challenge", max_eval=1000, batch_size=8
+            subset="ARC-Challenge", max_eval=1000, batch_size=8, collect_flops=collect_flops
         )
 
     if "lambada" in datasets:
         # 5️⃣ LAMBADA (long-range next-word prediction)
         eval_lambada(
             model, tokenizer, device, integrate_gpu_energy_joules,
-            max_eval=5000, batch_size=32
+            max_eval=5000, batch_size=32, collect_flops=collect_flops
         )
 
 ########################################
@@ -136,7 +136,7 @@ if __name__ == "__main__":
         # "boolq",
         # "piqa",
         # "hellaswag",
-        # "arc",
-        "lambada",
+        "arc",
+        # "lambada",
     ]
     evaluate(eval_datasets)

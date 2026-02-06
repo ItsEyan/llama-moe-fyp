@@ -12,6 +12,9 @@ valid_gate_type = ("linear", "mlp")
 from collections import Counter
 global_hist = Counter()
 
+global_k_hist = {}
+global_expert_hist = {}
+
 def get_gate_network(gate_type, input_size, num_experts):
     gate_type = gate_type.lower()
 
@@ -505,13 +508,10 @@ class DynamicTopGate(nn.Module):
         input_size: int,
         num_experts: int,
         num_selects: int = 2,                 # nominal k
-        select_strategy: str = "topp",        # topp | threshold | entropy_k | budget | topk
+        select_strategy: str = "topp",        # topp | entropy_k | budget | topk | margin | ratio | elbow
         k_min: int = 1,
         k_max: int = 8,
         p_min: float = 0.92,                  # nucleus threshold (topp)
-        tau: float = 0.02,                    # prob threshold (threshold)
-        target_k: float = 2.0,                # budget target
-        budget_weight: float = 5e-2,          # pull mean(k) toward target_k
         gate_network: str = "mlp",
         use_softmax: bool = True,
         use_balance: bool = True,
@@ -538,9 +538,6 @@ class DynamicTopGate(nn.Module):
         self.debug_samples = 5  # number of samples to show in debug printouts
 
         self.p_min = p_min
-        self.tau = tau
-        self.target_k = target_k
-        self.budget_weight = budget_weight
 
         self.gate_network_type = gate_network
         self.gate_network = get_gate_network(gate_network, input_size, num_experts)
@@ -560,17 +557,12 @@ class DynamicTopGate(nn.Module):
 
         self.register_buffer("p_min_buf", torch.tensor(self.p_min), persistent=False)
         self.pmin_lr = 1e-3
-        self.target_k = 2.1
         self.pmin_bounds = (0.45, 0.85)
 
         if self.add_noise:
             self.weight_noise = nn.Linear(input_size, num_experts, bias=False)
             self.normal = Normal(0.0, 1.0)
             self.softplus = nn.Softplus()
-
-        if self.select_strategy == "budget":
-            # learnable global threshold for budget strategy
-            self.lambda_param = nn.Parameter(torch.tensor(0.0))
 
         self.reset_parameters()
 
@@ -604,81 +596,101 @@ class DynamicTopGate(nn.Module):
         upper = min(self.k_max, self.num_selects + self.k_band)
         return torch.clamp(k_vec, min=lower, max=upper)
 
-    def _print_topp_debug(self, top_probs, k_vec):
-        import logging
-        B, E = top_probs.shape
+    def _print_generic_debug(
+        self,
+        top_probs: torch.Tensor,   # [B, Kband_hi]
+        k_vec: torch.Tensor,       # [B]
+        top_indices: torch.Tensor, # [B, Kmax]
+        top_mask: torch.Tensor,    # [B, Kmax] (0/1)
+    ):
+        """
+        Strategy-agnostic router diagnostics.
 
-        p1 = top_probs[:, 0]
-        p2 = top_probs[:, 1] if E > 1 else torch.zeros_like(p1)
-        p3 = top_probs[:, 2] if E > 2 else torch.zeros_like(p1)
-        cum = torch.cumsum(top_probs, dim=1)
-        p_at_1 = p1
-        p_at_2 = cum[:, 1] if E > 1 else p1
+        - Logs basic confidence stats (p1, gaps)
+        - Accumulates global histogram of selected k per token (global_hist)
+        - Prints accumulated histogram (counts + percentages)
 
-        gap12 = p1 - p2
-        gap23 = p2 - p3
+        Assumes `global_hist` is defined at module scope in moe_gates.py:
+            global_hist = {}
+        """
+        B, Kband_hi = top_probs.shape
 
-        def q(x):
-            x_f = x.float()
-            qs = torch.tensor([0.1, 0.5, 0.9], device=x.device, dtype=torch.float)
-            return torch.quantile(x_f, qs).tolist()
+        # --------------------------
+        # (A) k-per-token histogram
+        # --------------------------
+        hist = torch.bincount(
+            k_vec.to(torch.long),
+            minlength=int(self.k_max) + 1
+        )[: int(self.k_max) + 1]
 
-        logging.info(
-            f"[DynamicTopGate][topp] p_min={self.p_min:.3f} | T={self.logit_temperature} "
-            f"| band=[{self.num_selects-self.k_band},{self.num_selects+self.k_band}]"
-        )
-        logging.info(
-            f"  k_vec mean={float(k_vec.float().mean()):.3f} "
-            f"std={float(k_vec.float().std(unbiased=False)):.3f}"
-        )
-        logging.info(
-            f"  p1   mean/min/max: {float(p1.mean()):.6f} {float(p1.min()):.6f} {float(p1.max()):.6f}  "
-            f"quantiles@0.1,0.5,0.9: {[round(v,4) for v in q(p1)]}"
-        )
-        logging.info(
-            f"  p2   mean/min/max: {float(p2.mean()):.6f} {float(p2.min()):.6f} {float(p2.max()):.6f}  "
-            f"quantiles@0.1,0.5,0.9: {[round(v,4) for v in q(p2)]}"
-        )
-        logging.info(
-            f"  p3   mean/min/max: {float(p3.mean()):.6f} {float(p3.min()):.6f} {float(p3.max()):.6f}  "
-            f"quantiles@0.1,0.5,0.9: {[round(v,4) for v in q(p3)]}"
-        )
-        logging.info(
-            f"  p@1  mean/min/max: {float(p_at_1.mean()):.6f} {float(p_at_1.min()):.6f} {float(p_at_1.max()):.6f}  "
-            f"quantiles: {[round(v,4) for v in q(p_at_1)]}"
-        )
-        logging.info(
-            f"  p@2  mean/min/max: {float(p_at_2.mean()):.6f} {float(p_at_2.min()):.6f} {float(p_at_2.max()):.6f}  "
-            f"quantiles: {[round(v,4) for v in q(p_at_2)]}"
-        )
-        logging.info(
-            f"  gap12 mean/min/max: {float(gap12.mean()):.6f} {float(gap12.min()):.6f} {float(gap12.max()):.6f}  "
-            f"quantiles: {[round(v,4) for v in q(gap12)]}"
-        )
-        logging.info(
-            f"  gap23 mean/min/max: {float(gap23.mean()):.6f} {float(gap23.min()):.6f} {float(gap23.max()):.6f}  "
-            f"quantiles: {[round(v,4) for v in q(gap23)]}"
-        )
-
-        # histogram of chosen k
-        binc_max = int(self.k_max) + 1
-        hist = torch.bincount(k_vec, minlength=binc_max)[:binc_max].tolist()
-
-        # add to global histogram
         global global_hist
-        global_hist.update({i: hist[i] for i in range(len(hist))})
+        for k, c in enumerate(hist.tolist()):
+            if c > 0:
+                global_hist[k] = global_hist.get(k, 0) + c
 
-        logging.info(f"  k_vec hist (0..{self.k_max}): {hist}")
+        # --------------------------
+        # (B) expert activation histogram
+        # --------------------------
+        # active experts across all tokens (each selected expert counts once)
+        active_experts = top_indices[top_mask.bool()].to(torch.long)  # [N_active]
+        expert_counts = torch.bincount(active_experts, minlength=self.num_experts)
 
-        # show a few rows of top-5 probs and cum up to 5
-        show = min(self.debug_samples, B)
-        tp5 = top_probs[:show, : min(5, E)]
-        cum5 = torch.cumsum(tp5, dim=1)
-        for i in range(show):
-            row_p = [round(float(v), 4) for v in tp5[i]]
-            row_c = [round(float(v), 4) for v in cum5[i]]
-            logging.info(f"  ex[{i}] top5 p: {row_p} | cum: {row_c} | k={int(k_vec[i].item())}")
+        global global_expert_hist
+        for e, c in enumerate(expert_counts.tolist()):
+            if c > 0:
+                global_expert_hist[e] = global_expert_hist.get(e, 0) + c
 
+        # --------------------------
+        # (C) logging
+        # --------------------------
+        logging.info(
+            f"[DynamicTopGate][{self.select_strategy}] "
+            f"T={self.logit_temperature} "
+            f"band=[{self.num_selects-self.k_band},{self.num_selects+self.k_band}] "
+            f"k_range=[{self.k_min},{self.k_max}]"
+        )
+
+        logging.info(f"  batch k hist (0..{self.k_max}): {hist.tolist()}")
+
+        # accumulated k hist
+        total_k = sum(global_hist.values())
+        if total_k > 0:
+            items = sorted(global_hist.items())
+            logging.info("  accumulated k hist:")
+            for k, count in items:
+                logging.info(f"    k={k:>2d}: {count:>8d} ({100.0*count/total_k:5.2f}%)")
+
+        # accumulated expert hist
+        total_e = sum(global_expert_hist.values())
+        if total_e > 0:
+            items = sorted(global_expert_hist.items())
+            logging.info("  accumulated expert activations:")
+            for e, count in items:
+                logging.info(f"    expert={e:>2d}: {count:>8d} ({100.0*count/total_e:5.2f}%)")
+
+
+    def _print_topp_extra(self, top_probs):
+        cum = torch.cumsum(top_probs, dim=1)
+        p_at_2 = cum[:, 1] if top_probs.size(1) > 1 else top_probs[:, 0]
+        logging.info(
+            f"  topp p_min={self.p_min:.3f} "
+            f"p@2 mean={float(p_at_2.mean()):.4f}"
+        )
+
+    def _print_entropy_extra(self, top_probs):
+        p = top_probs.clamp_min(1e-12)
+        H = -(p * p.log()).sum(dim=1)
+        logging.info(
+            f"  entropy mean={float(H.mean()):.4f} "
+            f"min={float(H.min()):.4f} max={float(H.max()):.4f}"
+        )
+
+    def _print_margin_extra(self, top_probs):
+        p1 = top_probs[:, 0]
+        p2 = top_probs[:, 1]
+        logging.info(
+            f"  p1-p2 mean={float((p1-p2).mean()):.4f}"
+        )
 
     def _dynamic_select(self, logits):
         """
@@ -753,22 +765,28 @@ class DynamicTopGate(nn.Module):
                     self.p_min_buf.clamp_(*self.pmin_bounds)
                 self.p_min = float(self.p_min_buf.item())
 
-        elif self.select_strategy == "threshold":
-            # threshold on full probabilities (not just within band)
-            p = self.softmax(logits) if self.use_softmax else logits
-            k_counts = (p >= self.tau).sum(dim=1)
-            k_vec = k_counts.to(torch.long)
-
         elif self.select_strategy == "entropy_k":
+            # entropy over top-Kband_hi probs (cheap)
+            p = top_probs.clamp_min(1e-12)
+            H = -(p * p.log()).sum(dim=1)
+
+            # normalize by log(Kband_hi) so it's in [0,1]
+            H_norm = H / torch.log(torch.tensor(Kband_hi, device=device, dtype=p.dtype))
+
+            alpha = 2.0
+            H_scaled = H_norm.pow(alpha)
+
+            # IMPORTANT: keep original mapping range
+            k_low = self.k_min
+            k_high = min(self.num_selects, Kband_hi)
+            k_float = k_low + (k_high - k_low) * H_scaled
+            k_vec = k_float.round().to(torch.long)
+
+        elif self.select_strategy == "entropy_full":
             p = self.softmax(logits) if self.use_softmax else torch.softmax(logits, dim=1)
             H = -(p * p.clamp_min(1e-12).log()).sum(dim=1)
             H_norm = H / torch.log(torch.tensor(self.num_experts, device=device, dtype=p.dtype))
 
-            # Map entropy to a *small* k range
-            # k_low = self.k_min              # e.g. 1
-            # k_high = self.num_selects       # e.g. 4
-            # k_float = k_low + (k_high - k_low) * H_norm
-            # k_vec = k_float.round().to(torch.long)
             alpha = 2.0   # >1 → biases toward low k
             H_scaled = H_norm.pow(alpha)
 
@@ -779,12 +797,143 @@ class DynamicTopGate(nn.Module):
             k_vec = k_float.round().to(torch.long)
 
 
-        elif self.select_strategy == "budget":
-            # global learnable threshold
-            tau = torch.sigmoid(self.lambda_param)
-            p = self.softmax(logits) if self.use_softmax else logits
-            k_counts = (p >= tau).sum(dim=1)
-            k_vec = k_counts.to(torch.long)
+        elif self.select_strategy == "margin":
+            # --- logit margin ---
+            z1 = top_vals[:, 0]
+            z2 = top_vals[:, 1] if Kband_hi > 1 else z1.new_zeros(z1.shape)
+            m = (z1 - z2).clamp_min(0.0)  # [B]
+
+            # --- match entropy range ---
+            k_low  = int(self.k_min)                           # e.g. 2
+            k_high = int(min(self.num_selects, Kband_hi))      # e.g. 4
+
+            # If range collapses, fall back
+            if k_high <= k_low:
+                k_vec = torch.full((B,), k_low, device=device, dtype=torch.long)
+            else:
+                # ---------------------------------------------------------
+                # 3-bin calibrated rule:
+                #   small margin  -> k=4
+                #   medium margin -> k=3
+                #   large margin  -> k=2
+                #
+                # Set these from the printed quantiles of m:
+                #   t43 around ~ median (q50)
+                #   t32 around ~ upper quartile / q75–q85
+                # ---------------------------------------------------------
+                t43 = float(getattr(self, "margin_t43", 0.10))
+                t32 = float(getattr(self, "margin_t32", 0.40))
+                # Ensure ordering
+                if t32 <= t43:
+                    t32 = t43 + 1e-6
+
+                k_vec = torch.full((B,), k_high, device=device, dtype=torch.long)  # start at 4
+                k_vec = torch.where(m >= t43, torch.full_like(k_vec, max(k_low, 3)), k_vec)  # >=t43 => 3
+                k_vec = torch.where(m >= t32, torch.full_like(k_vec, max(k_low, 2)), k_vec)  # >=t32 => 2
+
+                # If your range isn't exactly {2,3,4}, clamp safely:
+                k_vec = k_vec.clamp(min=k_low, max=k_high)
+                
+            # if (not hasattr(self, "_printed_margin_stats")) or (not self._printed_margin_stats):
+            #     with torch.no_grad():
+            #         m32 = m.detach().float()
+            #         qs = m32.new_tensor([0.05, 0.25, 0.50, 0.75, 0.90])
+            #         qv = torch.quantile(m32, qs).cpu().tolist()
+            #         print("margin (z1-z2) quantiles 5/25/50/75/90:", [round(x, 4) for x in qv])
+            #     self._printed_margin_stats = True
+
+        elif self.select_strategy == "ratio":
+            """
+            Ratio-based confidence using p1/p2 computed from softmax(top_vals),
+            with per-layer auto-calibrated thresholds and 3-bin mapping.
+            Goal: mostly k=3–4, small k=2 tail, no drift to k=6.
+            """
+
+            # --- 0) Always compute probs from logits for ratio (don't trust top_probs) ---
+            p = torch.softmax(top_vals.float(), dim=1).to(top_vals.dtype)  # [B, Kband_hi]
+            p1 = p[:, 0]
+            p2 = p[:, 1] if Kband_hi > 1 else p1.new_full(p1.shape, 1e-6)
+            ratio = (p1 / p2.clamp_min(1e-6))  # [B], >= 1
+
+            # --- 1) Match entropy_k range ---
+            k_low  = int(self.k_min)
+            k_high = int(min(self.num_selects, Kband_hi))  # IMPORTANT: prevents k=5/6
+
+            if k_high <= k_low:
+                k_vec = torch.full((B,), k_low, device=device, dtype=torch.long)
+            else:
+                # --- 2) Auto-calibrate thresholds per gate instance ---
+                # Interpretation:
+                #   ratio small  => uncertain => k_high (4)
+                #   ratio medium =>           => 3
+                #   ratio large  => confident => 2
+                if getattr(self, "ratio_auto", True):
+                    with torch.no_grad():
+                        r32 = ratio.detach().float()
+                        # choose quantiles to control histogram:
+                        # q50: half the tokens become <=3 (instead of 4)
+                        # q90: top 10% become 2
+                        q_med = torch.quantile(r32, r32.new_tensor(0.50))
+                        q_hi  = torch.quantile(r32, r32.new_tensor(0.90))
+
+                        ema = float(getattr(self, "ratio_ema", 0.05))
+                        if not hasattr(self, "ratio_t43_buf"):
+                            self.ratio_t43_buf = q_med
+                            self.ratio_t32_buf = q_hi
+                        else:
+                            self.ratio_t43_buf = (1 - ema) * self.ratio_t43_buf + ema * q_med
+                            self.ratio_t32_buf = (1 - ema) * self.ratio_t32_buf + ema * q_hi
+
+                        r43 = float(self.ratio_t43_buf.item())
+                        r32 = float(self.ratio_t32_buf.item())
+                else:
+                    # manual fallback
+                    r43 = float(getattr(self, "ratio_r43", 1.5))
+                    r32 = float(getattr(self, "ratio_r32", 2.5))
+
+                # ensure ordering / minimal separation
+                min_gap = float(getattr(self, "ratio_min_gap", 0.10))
+                if r32 <= r43 + min_gap:
+                    r32 = r43 + min_gap
+
+                # --- 3) 3-bin decision ---
+                k_vec = torch.full((B,), k_high, device=device, dtype=torch.long)  # start at 4
+                k3 = max(k_low, min(3, k_high))
+                k2 = max(k_low, min(2, k_high))
+
+                k_vec = torch.where(ratio >= r43, torch.full_like(k_vec, k3), k_vec)  # >=r43 => 3
+                k_vec = torch.where(ratio >= r32, torch.full_like(k_vec, k2), k_vec)  # >=r32 => 2
+
+                k_vec = k_vec.clamp(min=k_low, max=k_high)
+                
+            # if (not hasattr(self, "_printed_ratio_stats")) or (not self._printed_ratio_stats):
+            #     with torch.no_grad():
+            #         r32 = ratio.detach().float()
+            #         qs = r32.new_tensor([0.05, 0.25, 0.50, 0.75, 0.90])
+            #         qv = torch.quantile(r32, qs).cpu().tolist()
+            #         print("ratio p1/p2 quantiles 5/25/50/75/90:", [round(x, 4) for x in qv])
+            #     self._printed_ratio_stats = True
+
+
+
+        elif self.select_strategy == "elbow":
+            # Pick smallest k such that adding one more expert doesn't add much mass.
+            # Uses per-step increments of cumulative probability.
+            cum = torch.cumsum(top_probs, dim=1)              # [B, Kband_hi]
+            inc = torch.cat([cum[:, :1], cum[:, 1:] - cum[:, :-1]], dim=1)  # [B, Kband_hi]
+
+            # "diminishing return" threshold: if next expert adds < eps mass, stop
+            eps = 0.06  # tune: smaller => picks larger k
+            # want first position j where inc[j] < eps AFTER at least 1 expert
+            # build mask for positions 1..Kband_hi-1
+            stop_mask = (inc[:, 1:] < eps)                    # [B, Kband_hi-1]
+            default_idx = torch.full((B,), Kband_hi - 1, device=device, dtype=torch.long)
+            idx_first_true = torch.where(
+                stop_mask.any(dim=1),
+                stop_mask.float().argmax(dim=1) + 1,          # +1 to account for skipping inc[:,0]
+                default_idx
+            )
+            k_vec = (idx_first_true + 1).to(torch.long)       # 1-based k
 
         else:
             raise ValueError(f"Unknown strategy {self.select_strategy}")
@@ -808,7 +957,19 @@ class DynamicTopGate(nn.Module):
         )                                             # [B,Kmax]
         top_indices = torch.where(top_mask.bool(), top_indices, pad_fill)
 
-        self._print_topp_debug(top_probs.detach(), k_vec.detach())
+        # self._print_generic_debug(
+        #     top_probs.detach(),
+        #     k_vec.detach(),
+        #     top_indices.detach(),
+        #     top_mask.detach(),
+        # )
+
+        # if self.select_strategy == "topp":
+        #     self._print_topp_extra(top_probs.detach())
+        # elif self.select_strategy == "entropy_k":
+        #     self._print_entropy_extra(top_probs.detach())
+        # elif self.select_strategy in {"margin", "ratio"}:
+        #     self._print_margin_extra(top_probs.detach())
 
         return top_indices, top_scores, top_mask, k_vec
 
