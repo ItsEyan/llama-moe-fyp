@@ -1,8 +1,13 @@
-from typing import List, Tuple, Dict, Optional
+from typing import List, Optional
 import torch
+import time
+import threading
 from datasets import load_dataset
 from tqdm import tqdm
 from dataclasses import dataclass
+from torch.profiler import profile, ProfilerActivity
+from pynvml import (nvmlInit, nvmlShutdown, nvmlDeviceGetHandleByIndex,
+                    nvmlDeviceGetPowerUsage)
 from torch.profiler import profile, ProfilerActivity
 
 @dataclass
@@ -12,6 +17,52 @@ class RunStats:
     processed_tokens: int = 0     # tokens model processed in forwards (prefix + suffix, all options)
     supervised_tokens: int = 0    # tokens we actually supervised/scored (e.g., only suffix)
     generated_tokens: int = 0     # for generative tasks (BoolQ)
+
+def integrate_gpu_energy_joules(fn, poll_ms=10, device_index=0):
+    """
+    Run `fn()` on the MAIN thread (so prints/logs show), and sample GPU power
+    in a background daemon thread. Returns (res, energy_J, avg_power_W, duration_s).
+    """
+    nvmlInit()
+    try:
+        handle = nvmlDeviceGetHandleByIndex(device_index)
+        samples = []
+        stop = threading.Event()
+
+        def sampler():
+            while not stop.is_set():
+                try:
+                    samples.append((time.perf_counter(), nvmlDeviceGetPowerUsage(handle)))
+                except Exception:
+                    pass
+                time.sleep(poll_ms / 1000.0)
+
+        t0 = time.perf_counter()
+        th = threading.Thread(target=sampler, daemon=True)
+        th.start()
+
+        res = fn()  # run eval on main thread
+
+        stop.set()
+        th.join(timeout=1.0)
+
+        t1 = time.perf_counter()
+        try:
+            samples.append((t1, nvmlDeviceGetPowerUsage(handle)))
+        except Exception:
+            pass
+
+        # trapezoidal integration (power in mW -> W)
+        energy_J = 0.0
+        for (t_prev, p_prev), (t_cur, p_cur) in zip(samples[:-1], samples[1:]):
+            dt = t_cur - t_prev
+            energy_J += 0.5 * ((p_prev + p_cur) / 1000.0) * dt
+
+        duration_s = t1 - t0
+        avg_power_W = (energy_J / duration_s) if duration_s > 0 else float("nan")
+        return res, energy_J, avg_power_W, duration_s
+    finally:
+        nvmlShutdown()
 
 def _report_energy(
     task_name: str,
@@ -251,8 +302,7 @@ def _collect_flops_once(
 
 # ---------- BoolQ ----------
 @torch.no_grad()
-def eval_boolq(model, tokenizer, device, integrate_gpu_energy_joules,
-               max_eval: int = 1024, batch_size: int = 8, collect_flops: bool = True):
+def eval_boolq(model, tokenizer, device, max_eval: int = 1024, batch_size: int = 8, collect_flops: bool = True):
     """
     BoolQ evaluation via conditional log-likelihood:
       score(" Yes" | prefix) vs score(" No" | prefix), choose higher.
@@ -347,8 +397,7 @@ def eval_boolq(model, tokenizer, device, integrate_gpu_energy_joules,
 
 # ---------- PIQA ----------
 @torch.no_grad()
-def eval_piqa(model, tokenizer, device, integrate_gpu_energy_joules,
-              batch_size: int = 16, max_eval: int = -1, collect_flops: bool = True):
+def eval_piqa(model, tokenizer, device, batch_size: int = 16, max_eval: int = -1, collect_flops: bool = True):
     ds = load_dataset("piqa")
     val = ds["validation"]
     if max_eval != -1:
@@ -411,8 +460,7 @@ def eval_piqa(model, tokenizer, device, integrate_gpu_energy_joules,
 # ---------- HellaSwag ----------
 @torch.no_grad()
 def eval_hellaswag(
-    model, tokenizer, device, integrate_gpu_energy_joules,
-    batch_size: int = 8, max_eval: int = -1, collect_flops: bool = True
+    model, tokenizer, device, batch_size: int = 8, max_eval: int = -1, collect_flops: bool = True
 ):
     ds = load_dataset("hellaswag")
     val = ds["validation"]
@@ -525,8 +573,7 @@ def eval_hellaswag(
 # ---------- ARC (Easy/Challenge) — robust batch handling + FLOPs ----------
 @torch.no_grad()
 def eval_arc(
-    model, tokenizer, device, integrate_gpu_energy_joules,
-    subset: str = "ARC-Challenge", batch_size: int = 8, max_eval: int = -1, collect_flops: bool = True
+    model, tokenizer, device, subset: str = "ARC-Challenge", batch_size: int = 8, max_eval: int = -1, collect_flops: bool = True
 ):
     ds = load_dataset("ai2_arc", subset)
     val = ds["validation"]
@@ -676,8 +723,7 @@ def eval_arc(
 # ---------- LAMBADA (robust batch handling + FLOPs) ----------
 @torch.no_grad()
 def eval_lambada(
-    model, tokenizer, device, integrate_gpu_energy_joules,
-    batch_size: int = 16, max_eval: int = 5000, max_len: int = 1024, collect_flops: bool = True
+    model, tokenizer, device, batch_size: int = 16, max_eval: int = 5000, max_len: int = 1024, collect_flops: bool = True
 ):
     # Try common sources
     try:

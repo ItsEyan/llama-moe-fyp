@@ -158,13 +158,7 @@ def main():
 
     if data_args.prob_map is None:
         data_args.prob_map = {
-            "en_cc": 0.67,
-            "en_c4": 0.15,
-            "github": 0.045,
-            "en_wikipedia": 0.045,
-            "en_book": 0.045,
-            "en_arxiv": 0.025,
-            "en_stack": 0.02,
+            "en_arxiv": 1.0
         }
 
     with training_args.main_process_first(desc="dataset map tokenization and grouping"):

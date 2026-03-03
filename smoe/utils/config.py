@@ -131,10 +131,10 @@ class ModelArguments:
             "help": "The type of gate network, should be one of `mlp` and `linear`"
         },
     )
-    gate_type: Literal["TopKBalancedNoisyGate", "SwitchBalancedGate"] = field(
+    gate_type: Literal["TopKBalancedNoisyGate", "SwitchBalancedGate", "DynamicTopGate"] = field(
         default="TopKBalancedNoisyGate",
         metadata={
-            "help": "The type of gate, should be one of `TopKBalancedNoisyGate` and `SwitchBalancedGate`"
+            "help": "The type of gate, should be one of `TopKBalancedNoisyGate` and `SwitchBalancedGate`, and `DynamicTopGate`"
         },
     )
     calculator_type: Literal[
@@ -331,6 +331,26 @@ class EnhancedTrainingArguments(TrainingArguments):
         metadata={
             "help": "dynamic data selection strategy (change data portion dynamically based on current loss and reference loss)."
         },
+    )
+    router_loss_weight: float = field(
+        default=0.01,
+        metadata={"help": "Weight for router regularization loss."}
+    )
+
+    # Encourage top-2 mass to be near a target (prevents collapse)
+    router_top2_target: float = field(
+        default=0.90,
+        metadata={"help": "Target for top-2 probability mass in router probs_full."}
+    )
+
+    router_top2_kind: str = field(
+        default="l1",  # "l1" | "l2" | "hinge"
+        metadata={"help": "Type of top-2 mass regularizer: l1, l2, hinge."}
+    )
+
+    router_top2_margin: float = field(
+        default=0.05,
+        metadata={"help": "Margin used by hinge loss: penalty only if outside [target-margin, target+margin]."}
     )
 
     @property

@@ -1,7 +1,13 @@
 import os
 
 import torch
+import json
+import sys
+import time
+from dataclasses import asdict, is_dataclass
+from typing import Any, Dict
 from smoe.modules.lora.lora_gate import (
+    LoRALinear,
     inject_lora_into_moe_gates,
     freeze_all_but_router_lora,
     save_router_lora
@@ -54,7 +60,97 @@ class SaveGateLoRACallback(TrainerCallback):
         save_dir = ckpt_dir if os.path.isdir(ckpt_dir) else args.output_dir
         save_router_lora(model, save_dir)
         return control
+    
+def _to_serializable(obj: Any) -> Any:
+    # Handles dataclasses, TrainingArguments, Path, sets, etc.
+    if is_dataclass(obj):
+        return asdict(obj)
+    if hasattr(obj, "to_dict"):  # HF TrainingArguments, etc.
+        return obj.to_dict()
+    if hasattr(obj, "__dict__"):
+        return obj.__dict__
+    if isinstance(obj, (set, tuple)):
+        return list(obj)
+    return obj
 
+def write_run_hparams_file(
+    output_dir: str,
+    model_args,
+    data_args,
+    training_args,
+    last_checkpoint: str | None,
+    extra: Dict[str, Any] | None = None,
+    filename_json: str = "run_hparams.json",
+    filename_txt: str = "run_hparams.txt",
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+
+    payload: Dict[str, Any] = {
+        "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "argv": " ".join(sys.argv),
+        "resume": {
+            "resume_from_checkpoint": getattr(training_args, "resume_from_checkpoint", None),
+            "last_checkpoint_detected": last_checkpoint,
+        },
+        "model_args": _to_serializable(model_args),
+        "data_args": _to_serializable(data_args),
+        "training_args": _to_serializable(training_args),
+    }
+    if extra:
+        payload.update(extra)
+
+    # Atomic write to avoid partial files if job dies
+    tmp_json = os.path.join(output_dir, filename_json + ".tmp")
+    final_json = os.path.join(output_dir, filename_json)
+    with open(tmp_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True, ensure_ascii=False, default=str)
+    os.replace(tmp_json, final_json)
+
+    # A short human-readable summary (nice for quick inspection)
+    def pick(d, keys):
+        return {k: d.get(k) for k in keys if k in d}
+
+    ta = payload["training_args"]
+    da = payload["data_args"]
+    ma = payload["model_args"]
+
+    summary = {
+        "model": pick(ma, ["model_type", "model_name_or_path", "tokenizer_name_or_path"]),
+        "data": pick(da, ["dataset_dir", "block_size", "max_train_samples", "prob_map"]),
+        "train": pick(ta, [
+            "max_steps", "learning_rate", "warmup_steps",
+            "per_device_train_batch_size", "gradient_accumulation_steps",
+            "fp16", "bf16", "tf32", "torch_dtype", "gradient_checkpointing",
+            "logging_steps", "save_steps", "seed",
+            "lora_rank", "lora_alpha", "lora_dropout",
+            "router_loss_weight", "router_top2_target", "router_top2_kind", "router_top2_margin",
+        ]),
+        "output_dir": output_dir,
+        "resume": payload["resume"],
+    }
+
+    tmp_txt = os.path.join(output_dir, filename_txt + ".tmp")
+    final_txt = os.path.join(output_dir, filename_txt)
+    with open(tmp_txt, "w", encoding="utf-8") as f:
+        f.write(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+        f.write("\n")
+    os.replace(tmp_txt, final_txt)
+
+def dump_gate_settings(model, logger):
+    wanted = ["select_strategy", "selection_strategy", "dynamic_select",
+              "entropy_full", "entropy_mode", "k_strategy",
+              "num_select", "top_k", "k", "target_k"]
+
+    logger.info("=== Dumping MoE gate/router module settings ===")
+    for name, m in model.named_modules():
+        cls = m.__class__.__name__
+        if "Gate" in cls or "Router" in cls:  # adjust if your class names differ
+            fields = {}
+            for k in wanted:
+                if hasattr(m, k):
+                    fields[k] = getattr(m, k)
+            if fields:
+                print(f"[{name}] {cls} -> {fields}")
 
 def main():
     model_args, data_args, training_args = parse_args(
@@ -69,6 +165,7 @@ def main():
         f"fp16 training: {training_args.fp16}, "
         f"bf16 training: {training_args.bf16}"
     )
+    # logger.info(f"Model args: {model_args}")
     logger.info(f"Model args: {model_args}")
     logger.info(f"Data args: {data_args}")
     logger.info(f"Training args: {training_args.to_json_string()}")
@@ -167,13 +264,7 @@ def main():
 
     if not isinstance(data_args.prob_map, dict):
         data_args.prob_map = {
-            "en_cc": 0.67,
-            "en_c4": 0.15,
-            "github": 0.045,
-            "en_wikipedia": 0.045,
-            "en_book": 0.045,
-            "en_arxiv": 0.025,
-            "en_stack": 0.02,
+            "en_arxiv": 1.0
         }
 
     with training_args.main_process_first(desc="dataset map tokenization and grouping"):
@@ -200,6 +291,16 @@ def main():
     eval_dataset = None
     if training_args.do_eval:
         raise NotImplementedError
+    
+    def dump_config_routing_bits(config, logger):
+        keys = [k for k in config.to_dict().keys()
+                if any(s in k.lower() for s in ["gate", "router", "select", "entropy", "top", "moe"])]
+        print("=== Config routing-related fields ===")
+        for k in sorted(keys):
+            print(f"config.{k} = {getattr(config, k, None)}")
+
+    dump_config_routing_bits(config, logger)
+
 
     if model_args.model_name_or_path:
         torch_dtype = (
@@ -227,6 +328,7 @@ def main():
         #     model.change_moe_gate_add_noise(False)
         #     model.change_moe_gate_use_balance(False)
         replace_xformers(model)
+        dump_gate_settings(model, logger)
     else:
         model = AutoModelForCausalLM.from_config(config)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
@@ -250,8 +352,25 @@ def main():
         dropout=training_args.lora_dropout,
     )
     logger.info(f"GateLoRA injection: {info}")
+    
+    # for name, module in model.named_modules():
+    #     if isinstance(module, LoRALinear):
+    #         print("LoRA injected at:", name)
 
     freeze_all_but_router_lora(model, train_gate_noise=False)
+    
+    # router_cache = []
+
+    # def gate_hook(module, inp, out):
+    #     router_cache.append(out)
+
+    # for m in model.modules():
+    #     if m.__class__.__name__ == "DynamicTopGate":
+    #         m.register_forward_hook(gate_hook)
+
+    if training_args.should_save:
+        save_router_lora(model, training_args.output_dir, filename="router_lora_init.pt")
+
     get_trainable_parameters(model, verbose=True)
 
     # Initialize our Trainer
@@ -275,6 +394,24 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+            
+        # Write run hyperparams once (DDP-safe)
+        is_world_zero = int(getattr(training_args, "process_index", 0)) == 0
+        if is_world_zero:
+            write_run_hparams_file(
+                output_dir=training_args.output_dir,
+                model_args=model_args,
+                data_args=data_args,
+                training_args=training_args,
+                last_checkpoint=last_checkpoint,
+                extra={
+                    "notes": {
+                        "purpose": "Gate LoRA router training run hyperparameters",
+                    }
+                },
+            )
+            logger.info(f"Wrote run hyperparams to {training_args.output_dir}/run_hparams.json")
+        
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
         metrics = train_result.metrics

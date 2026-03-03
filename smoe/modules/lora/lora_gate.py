@@ -9,23 +9,37 @@ class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r=8, alpha=16, dropout=0.0):
         super().__init__()
         assert isinstance(base, nn.Linear)
-        assert base.bias is None  # your gates use bias=False
+        assert base.bias is None
 
+        dtype_base = base.weight.dtype
+        device = base.weight.device
+
+        # keep frozen base weights as-is
         self.weight = nn.Parameter(base.weight.detach().clone(), requires_grad=False)
+
+        # IMPORTANT: LoRA params in fp32 for fp16+GradScaler stability
+        lora_dtype = torch.float32
+
         self.r = int(r)
         self.alpha = float(alpha)
         self.scaling = self.alpha / self.r
         self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
 
-        self.lora_A = nn.Parameter(torch.zeros(self.r, base.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, self.r))
+        self.lora_A = nn.Parameter(torch.zeros(self.r, base.in_features, device=device, dtype=lora_dtype))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, self.r, device=device, dtype=lora_dtype))
+
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
-        out = F.linear(x, self.weight)
-        delta = (self.dropout(x) @ self.lora_A.t()) @ self.lora_B.t()
+        out = F.linear(x, self.weight)  # uses frozen fp16 weights
+
+        A = self.lora_A.to(dtype=x.dtype)
+        B = self.lora_B.to(dtype=x.dtype)
+
+        delta = (self.dropout(x) @ A.t()) @ B.t()
         return out + self.scaling * delta
+
 
 
 def _replace_linears(module: nn.Module, make):

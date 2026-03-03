@@ -1,4 +1,0 @@
-{"text":"Hello world. This is a smoke test for gate LoRA training."}
-{"text":"We want the MoE router to learn input-aware routing signals."}
-{"text":"Short samples are fine. The loader will group into block_size chunks."}
-{"text":"Add more lines if you want more variety."}

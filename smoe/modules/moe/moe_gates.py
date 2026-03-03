@@ -508,10 +508,11 @@ class DynamicTopGate(nn.Module):
         input_size: int,
         num_experts: int,
         num_selects: int = 2,                 # nominal k
-        select_strategy: str = "topp",        # topp | entropy_k | budget | topk | margin | ratio | elbow
+        select_strategy: str = "entropy_full",        # topp | entropy_k | budget | topk | margin | ratio | elbow
         k_min: int = 1,
         k_max: int = 8,
         p_min: float = 0.92,                  # nucleus threshold (topp)
+        target_k: float = 2.1,
         gate_network: str = "mlp",
         use_softmax: bool = True,
         use_balance: bool = True,
@@ -535,6 +536,7 @@ class DynamicTopGate(nn.Module):
         self.k_min = k_min
         self.k_max = k_max
         self.k_band = max(0, int(k_band))
+        self.target_k = target_k
         self.debug_samples = 5  # number of samples to show in debug printouts
 
         self.p_min = p_min
@@ -795,6 +797,7 @@ class DynamicTopGate(nn.Module):
 
             k_float = k_low + (k_high - k_low) * H_scaled
             k_vec = k_float.round().to(torch.long)
+            # k_vec = k_float.floor().clamp(k_low, k_high).long()
 
 
         elif self.select_strategy == "margin":
@@ -917,23 +920,69 @@ class DynamicTopGate(nn.Module):
 
 
         elif self.select_strategy == "elbow":
-            # Pick smallest k such that adding one more expert doesn't add much mass.
-            # Uses per-step increments of cumulative probability.
-            cum = torch.cumsum(top_probs, dim=1)              # [B, Kband_hi]
-            inc = torch.cat([cum[:, :1], cum[:, 1:] - cum[:, :-1]], dim=1)  # [B, Kband_hi]
+            """
+            Elbow selection: choose smallest k such that the next expert's probability
+            falls below a threshold eps. Uses softmax(top_vals) to ensure true probs.
 
-            # "diminishing return" threshold: if next expert adds < eps mass, stop
-            eps = 0.06  # tune: smaller => picks larger k
-            # want first position j where inc[j] < eps AFTER at least 1 expert
-            # build mask for positions 1..Kband_hi-1
-            stop_mask = (inc[:, 1:] < eps)                    # [B, Kband_hi-1]
-            default_idx = torch.full((B,), Kband_hi - 1, device=device, dtype=torch.long)
-            idx_first_true = torch.where(
-                stop_mask.any(dim=1),
-                stop_mask.float().argmax(dim=1) + 1,          # +1 to account for skipping inc[:,0]
-                default_idx
-            )
-            k_vec = (idx_first_true + 1).to(torch.long)       # 1-based k
+            Auto-calibrated per gate instance to avoid collapsing to k=Kband_hi.
+            """
+
+            # --- 0) Always use true probs (don't trust top_probs) ---
+            p = torch.softmax(top_vals.float(), dim=1).to(top_vals.dtype)  # [B, Kband_hi]
+
+            # --- 1) Match entropy_k range (IMPORTANT) ---
+            k_low  = int(self.k_min)
+            k_high = int(min(self.num_selects, Kband_hi))  # prevents drift to 5/6
+
+            if k_high <= k_low:
+                k_vec = torch.full((B,), k_low, device=device, dtype=torch.long)
+            else:
+                # We decide k in {1..Kband_hi} then clamp to [k_low..k_high]
+                # Stop when p_{k+1} < eps (i.e., next expert adds little)
+                # We'll only consider k up to k_high, since we don't want >k_high anyway.
+
+                # --- 2) Auto-calibrate eps per layer ---
+                # A good eps should be around the typical p3/p4 region.
+                # Use the distribution of p[:, 2] (3rd expert) as a reference.
+                if getattr(self, "elbow_auto", True) and Kband_hi >= 3:
+                    with torch.no_grad():
+                        ref = p[:, 2].detach().float()  # probability of 3rd expert
+                        # pick eps as a percentile of p3: smaller eps => larger k, larger eps => smaller k
+                        # Start with q50 so about half the time p3 < eps -> k<=2/3 boundary shifts.
+                        q = float(getattr(self, "elbow_ref_q", 0.50))
+                        eps_q = torch.quantile(ref, ref.new_tensor(q))
+
+                        ema = float(getattr(self, "elbow_ema", 0.05))
+                        if not hasattr(self, "elbow_eps_buf"):
+                            self.elbow_eps_buf = eps_q
+                        else:
+                            self.elbow_eps_buf = (1 - ema) * self.elbow_eps_buf + ema * eps_q
+
+                        eps = float(self.elbow_eps_buf.item())
+                else:
+                    eps = float(getattr(self, "elbow_eps", 0.08))  # manual fallback (note: higher than 0.06)
+
+                # --- 3) Find first k where next prob < eps ---
+                # Build next-prob matrix aligned with k positions:
+                # for k=1, check p2; for k=2, check p3; ... for k=Kband_hi-1, check pK
+                next_p = p[:, 1:]  # [B, Kband_hi-1]  -> next_p[:, k-1] is p_{k+1}
+
+                stop_mask = (next_p < eps)  # [B, Kband_hi-1]
+                default_idx = torch.full((B,), Kband_hi - 2, device=device, dtype=torch.long)
+                # default_idx corresponds to k = (default_idx+1) = Kband_hi-1 (since next_p has length Kband_hi-1)
+
+                idx_first_true = torch.where(
+                    stop_mask.any(dim=1),
+                    stop_mask.float().argmax(dim=1),  # index in next_p, 0-based
+                    default_idx
+                )
+
+                k_raw = (idx_first_true + 1).to(torch.long)  # because idx=0 => k=1
+                # k_raw is in [1..Kband_hi-1]; if never stops -> Kband_hi-1
+
+                # --- 4) Clamp into desired range ---
+                k_vec = k_raw.clamp(min=k_low, max=k_high)
+
 
         else:
             raise ValueError(f"Unknown strategy {self.select_strategy}")
@@ -978,6 +1027,8 @@ class DynamicTopGate(nn.Module):
         logits_gate = self.gate_network(x)                       # [B,E]
         logits, logits_noise, noise_control = self._apply_noise(x, logits_gate)
         logits_t = self._temper(logits)                          # temperature before selection
+        
+        probs_full = torch.softmax(logits_t.float(), dim=1).to(logits_t.dtype)
 
         top_indices, top_scores, top_mask, k_vec = self._dynamic_select(logits_t)
 
@@ -1018,7 +1069,10 @@ class DynamicTopGate(nn.Module):
             "importance": importance,        # [E]
             "load": load,                    # [E]
             "balance_loss": balance_loss,    # scalar
-            "k_vec": k_vec                   # [B]
+            "k_vec": k_vec,                  # [B]
+            "logits_t": logits_t,            # [B, E] (post-noise, post-temperature)
+            "logits_gate": logits_gate,      # [B, E] (pre-noise, pre-temp)
+            "probs_full": probs_full,        # [B, E]
         }
 
         # optional budget loss

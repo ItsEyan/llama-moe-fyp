@@ -60,6 +60,8 @@ from smoe.data.dynamic_selection import (
 )
 from smoe.utils.config import EnhancedTrainingArguments
 
+PREFIX_CHECKPOINT_DIR = "checkpoint"
+
 if is_apex_available():
     from apex import amp
 
@@ -158,6 +160,148 @@ class LlamaLrSchedulingTrainer(Trainer):
             is_local_process_zero=self.is_local_process_zero(),
             is_world_process_zero=self.is_world_process_zero(),
         )
+        
+        self._router_hooks = []
+        self._router_loss_acc = None
+        self._router_entropy_acc = None
+        self._router_layers = 0
+        self._router_kmean_acc = None
+        
+    def _register_router_hooks(self, model_to_hook: nn.Module):
+        # remove existing hooks
+        for h in getattr(self, "_router_hooks", []):
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self._router_hooks = []
+
+        model_unwrapped = unwrap_model(model_to_hook)
+
+        def hook_fn(module, inp, out):
+            if not isinstance(out, dict):
+                if not getattr(self, "_printed_out_type", False):
+                    logger.warning(f"[SANITY] Hook out type is {type(out)} (not dict).")
+                    self._printed_out_type = True
+                return
+            p = out.get("probs_full", None)
+            if p is None:
+                return
+            if getattr(self, "_printed_p_grad", False) is False:
+                if p is not None:
+                    logger.warning(f"[SANITY] probs_full.requires_grad={p.requires_grad}, "
+                                f"grad_fn={type(p.grad_fn).__name__ if p.grad_fn is not None else None}, "
+                                f"dtype={p.dtype}, shape={tuple(p.shape)}")
+                self._printed_p_grad = True
+
+            if self._router_loss_acc is None:
+                self._router_loss_acc = p.new_zeros(())
+                self._router_entropy_acc = p.new_zeros(())
+                self._router_kmean_acc = p.new_zeros(())
+                self._router_layers = 0
+
+            loss_layer = out["balance_loss"]
+            self._router_loss_acc += loss_layer
+
+            p_safe = p.clamp_min(1e-12)
+            ent_layer = (-(p_safe * p_safe.log()).sum(dim=1)).mean()
+            self._router_entropy_acc = self._router_entropy_acc + ent_layer
+            
+            k_vec = out.get("k_vec", None)
+            if k_vec is None:
+                raise RuntimeError("DynamicTopGate output missing k_vec; cannot compute mean_k.")
+            k_layer = k_vec.float().mean()
+            self._router_kmean_acc = self._router_kmean_acc + k_layer
+
+            self._router_layers += 1
+
+        for m in model_unwrapped.modules():
+            if m.__class__.__name__ == "DynamicTopGate":
+                self._router_hooks.append(m.register_forward_hook(hook_fn))
+
+        logger.info(f"Registered {len(self._router_hooks)} DynamicTopGate hooks on executing model.")
+
+    def _top2_regularizer(self, p: torch.Tensor) -> torch.Tensor:
+        """
+        p: [B, E] probs_full
+        Returns a scalar loss encouraging top-2 mass to stay near a target band.
+        """
+        top2_mass = torch.topk(p, k=2, dim=1).values.sum(dim=1)  # [B]
+        target = float(getattr(self.args, "router_top2_target", 0.90))
+        kind = str(getattr(self.args, "router_top2_kind", "l1")).lower()
+        margin = float(getattr(self.args, "router_top2_margin", 0.05))
+
+        if kind == "l2":
+            return ((top2_mass - target) ** 2).mean()
+        elif kind == "hinge":
+            lo = target - margin
+            hi = target + margin
+            # penalize only outside band
+            return (torch.relu(lo - top2_mass) + torch.relu(top2_mass - hi)).mean()
+        else:
+            # default: l1
+            return (top2_mass - target).abs().mean()
+
+        
+    def compute_loss(self, model, inputs, return_outputs=False):
+        self._router_kmean_acc = None
+        self._router_loss_acc = None
+        self._router_entropy_acc = None
+        self._router_layers = 0
+
+        outputs = model(**inputs)
+        
+        if self._router_layers == 0:
+            raise RuntimeError(
+                "Router hooks did not fire (router_layers=0). "
+                "This means you are not collecting probs_full, so router_loss is constant and loss has no grad."
+            )
+        
+        if self._router_layers > 0:
+            router_loss = self._router_loss_acc / self._router_layers
+            router_entropy = self._router_entropy_acc / self._router_layers
+        else:
+            router_loss = outputs.loss.new_zeros(())
+            router_entropy = outputs.loss.new_zeros(())
+
+        lam = float(getattr(self.args, "router_loss_weight", 1e-3))
+        mean_k = self._router_kmean_acc / self._router_layers
+        k_target = float(getattr(self.args, "router_target_mean_k", 2.3))
+        lam_k = float(getattr(self.args, "router_kmatch_weight", 0.1))
+        kmatch = (mean_k - mean_k.new_tensor(k_target)).pow(2)
+        loss = outputs.loss + lam * router_loss + lam_k * kmatch
+        
+        if self.state.global_step < 3 and self.is_local_process_zero():
+            logger.warning(f"[SANITY] mean_k.requires_grad={mean_k.requires_grad}, kmatch.requires_grad={kmatch.requires_grad}")
+
+
+        # logging fields must be tensors
+        outputs.router_loss = router_loss.detach()
+        outputs.router_entropy = router_entropy.detach()
+        outputs.router_mean_k = mean_k.detach()
+        outputs.router_kmatch = kmatch.detach()
+
+        if self.state.global_step < 3 and self.is_local_process_zero():
+            logger.warning(
+                f"[SANITY] layers={self._router_layers} "
+                f"router_loss_requires_grad={(router_loss.requires_grad if self._router_layers>0 else None)} "
+                f"lm_loss_requires_grad={outputs.loss.requires_grad}"
+            )
+
+            # Check a single LoRA param
+            for n, p in unwrap_model(model).named_parameters():
+                if "lora_A" in n or "lora_B" in n:
+                    logger.warning(f"[SANITY] trainable param example: {n} requires_grad={p.requires_grad} "
+                                f"grad_is_None={(p.grad is None)} shape={tuple(p.shape)}")
+                    break
+
+        if not loss.requires_grad:
+            raise RuntimeError(
+                "Loss has no grad. Likely you detached router probs/loss or LM loss has no trainable path."
+            )
+        
+        return (loss, outputs) if return_outputs else loss
+
 
     def create_optimizer(self):
         """
@@ -281,6 +425,10 @@ class LlamaLrSchedulingTrainer(Trainer):
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
+        # register once (or re-register if needed)
+        if not getattr(self, "_router_hooks", None):
+            self._register_router_hooks(model)
+        
         model.train()
         inputs = self._prepare_inputs(inputs)
 
@@ -319,6 +467,8 @@ class LlamaLrSchedulingTrainer(Trainer):
         num_dropped_tokens: tuple[int] = None,
         gate_load: tuple[torch.FloatTensor] = None,
         gate_importance: tuple[torch.FloatTensor] = None,
+        router_loss: torch.FloatTensor = None,
+        router_entropy: torch.FloatTensor = None,
     ):
         if self.control.should_log:
             if is_torch_tpu_available():
@@ -346,6 +496,11 @@ class LlamaLrSchedulingTrainer(Trainer):
             logs["balance_loss"] = balance_loss.item()
             logs["tot_consumed_tokens"] = self.state.tot_consumed_tokens
             logs["prob_map"] = self.train_dataset.prob_map
+            
+            if router_loss is not None:
+                logs["router_loss"] = router_loss.item()
+            if router_entropy is not None:
+                logs["router_entropy"] = router_entropy.item()
 
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
@@ -673,6 +828,9 @@ class LlamaLrSchedulingTrainer(Trainer):
         # backward compatibility
         if self.is_deepspeed_enabled:
             self.deepspeed = self.model_wrapped
+            
+        # register router hooks on the actual model that will run forward
+        self._register_router_hooks(model)
 
         # deepspeed ckpt loading
         if resume_from_checkpoint is not None and self.is_deepspeed_enabled:
@@ -985,6 +1143,8 @@ class LlamaLrSchedulingTrainer(Trainer):
                         "num_dropped_tokens",
                         "gate_load",
                         "gate_importance",
+                        "router_loss",
+                        "router_entropy",
                     ]
                     _result_dict = {key: None for key in keys}
                     for key in keys:
@@ -1102,3 +1262,33 @@ class LlamaLrSchedulingTrainer(Trainer):
         )
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # ---- save ONLY router lora ----
+        m = unwrap_model(model)
+        router_path = os.path.join(output_dir, "router_lora.pt")
+
+        # If you already have a canonical function to export router LoRA, call it here.
+        # Otherwise, filter params by name:
+        sd = {
+            name: p.detach().cpu()
+            for name, p in m.named_parameters()
+            if p.requires_grad
+        }
+        torch.save(sd, router_path)
+
+        # ---- minimal trainer state (optional but recommended) ----
+        if self.args.should_save:
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+            torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+        # rotate old checkpoints
+        if self.args.should_save:
+            self._rotate_checkpoints(use_mtime=True, output_dir=run_dir)
+

@@ -177,3 +177,4 @@ smoe/entrypoint/analysis/gating_*.py
 /tensorboard/
 models/
 topp_debug.txt
+data/

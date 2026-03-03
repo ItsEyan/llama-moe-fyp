@@ -67,6 +67,13 @@ class LlamaMoEDecoderLayer(LlamaDecoderLayer):
             "gate_add_noise": config.gate_add_noise,
             # TopKBalancedNoisyGate
             "gate_noise_epsilon": config.gate_noise_epsilon,
+            # DynamicTopGate
+            "k_min": config.k_min,
+            "k_max": config.k_max,
+            "k_band": config.k_band,
+            "select_strategy": config.select_strategy,
+            "p_min": config.p_min,
+            "logit_temperature": config.logit_temperature,
         }
         calculator_config = {
             # all calculators
