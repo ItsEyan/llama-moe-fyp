@@ -178,3 +178,4 @@ smoe/entrypoint/analysis/gating_*.py
 models/
 topp_debug.txt
 data/
+llama-moe/LLaMA-MoE-v1-3_5B-4_16
