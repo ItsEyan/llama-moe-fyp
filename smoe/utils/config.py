@@ -179,6 +179,14 @@ class DataArguments:
         default=None,
         metadata={"help": "The name of the dataset to use (via the datasets library)."},
     )
+    dataset_name: str = field(
+        default="redpajama",
+        metadata={"help": "Which dataset loader to use: redpajama | lambada"}
+    )
+    dataset_split: str = field(
+        default="train",
+        metadata={"help": "Split for HF datasets (train/validation/test). Used for lambada."}
+    )
     validation_dir: Optional[str] = field(
         default=None,
         metadata={
@@ -331,26 +339,6 @@ class EnhancedTrainingArguments(TrainingArguments):
         metadata={
             "help": "dynamic data selection strategy (change data portion dynamically based on current loss and reference loss)."
         },
-    )
-    router_loss_weight: float = field(
-        default=0.01,
-        metadata={"help": "Weight for router regularization loss."}
-    )
-
-    # Encourage top-2 mass to be near a target (prevents collapse)
-    router_top2_target: float = field(
-        default=0.90,
-        metadata={"help": "Target for top-2 probability mass in router probs_full."}
-    )
-
-    router_top2_kind: str = field(
-        default="l1",  # "l1" | "l2" | "hinge"
-        metadata={"help": "Type of top-2 mass regularizer: l1, l2, hinge."}
-    )
-
-    router_top2_margin: float = field(
-        default=0.05,
-        metadata={"help": "Margin used by hinge loss: penalty only if outside [target-margin, target+margin]."}
     )
 
     @property

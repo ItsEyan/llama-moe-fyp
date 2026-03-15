@@ -4,6 +4,7 @@ import torch
 import json
 import sys
 import time
+import re
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict
 from smoe.modules.lora.lora_gate import (
@@ -26,6 +27,10 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers import TrainerCallback
 from smoe.data.collate_fn import fault_tolerance_data_collator
 from smoe.data.redpajama import load_streaming_datasets
+from smoe.data.collate_fn import FaultTolerantCausalLMCollator
+from smoe.data.collate_fn import FaultTolerantMultipleChoiceCollator
+from smoe.data.arc import load_arc_c_streaming_dataset
+from smoe.data.lambada import load_lambada_streaming_dataset
 from smoe.models.llama_moe.configuration_llama_moe import LlamaMoEConfig
 from smoe.models.llama_moe.modeling_llama_moe import LlamaMoEForCausalLM
 from smoe.modules.flash_attn import replace_xformers
@@ -50,6 +55,8 @@ CONFIG_MAPPING.update(
         "llama_moe": LlamaMoEConfig,
     }
 )
+
+ARC_DATASET_NAMES = {"arc-c", "arc_c", "arc-challenge", "ARC-Challenge"}
 
 class SaveGateLoRACallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs):
@@ -123,7 +130,7 @@ def write_run_hparams_file(
             "fp16", "bf16", "tf32", "torch_dtype", "gradient_checkpointing",
             "logging_steps", "save_steps", "seed",
             "lora_rank", "lora_alpha", "lora_dropout",
-            "router_loss_weight", "router_top2_target", "router_top2_kind", "router_top2_margin",
+            # "router_loss_weight", "router_top2_target", "router_top2_kind", "router_top2_margin",
         ]),
         "output_dir": output_dir,
         "resume": payload["resume"],
@@ -151,11 +158,17 @@ def dump_gate_settings(model, logger):
                     fields[k] = getattr(m, k)
             if fields:
                 print(f"[{name}] {cls} -> {fields}")
+                
+
+def step_from_checkpoint(path: str) -> int | None:
+    m = re.search(r"checkpoint-(\d+)$", path)
+    return int(m.group(1)) if m else None
 
 def main():
     model_args, data_args, training_args = parse_args(
         ModelArguments, DataArguments, LoraTrainingArguments
     )
+    print("Dataset: ", data_args.dataset_name)
     logger = get_logger_from_training_args(__name__, training_args)
     logger.warning(
         f"Process local rank: {training_args.local_rank}, "
@@ -165,13 +178,13 @@ def main():
         f"fp16 training: {training_args.fp16}, "
         f"bf16 training: {training_args.bf16}"
     )
-    # logger.info(f"Model args: {model_args}")
     logger.info(f"Model args: {model_args}")
     logger.info(f"Data args: {data_args}")
     logger.info(f"Training args: {training_args.to_json_string()}")
 
     # Detecting last checkpoint.
     last_checkpoint = None
+    checkpoint = None
     if (
         os.path.isdir(training_args.output_dir)
         and training_args.do_train
@@ -267,16 +280,39 @@ def main():
             "en_arxiv": 1.0
         }
 
-    with training_args.main_process_first(desc="dataset map tokenization and grouping"):
-        lm_datasets = load_streaming_datasets(
-            data_args.dataset_dir,
-            tokenizer=tokenizer,
-            text_field=getattr(data_args, "text_field", "text"),
-            prob_map=data_args.prob_map,
-            num_proc=data_args.preprocessing_num_workers,
-            debug_mode=training_args.debug_mode,
-            block_size=block_size,
-        )
+    if data_args.dataset_name == "lambada":
+        with training_args.main_process_first(desc="dataset map tokenization (lambada)"):
+            lm_datasets = load_lambada_streaming_dataset(
+                tokenizer=tokenizer,
+                split="train",
+                text_field=getattr(data_args, "text_field", "text"),
+                block_size=block_size,
+                debug_mode=training_args.debug_mode,
+                supervise_last_n_tokens=8,
+            )
+
+    elif data_args.dataset_name in ARC_DATASET_NAMES:
+        with training_args.main_process_first(desc="dataset map tokenization (arc-c)"):
+            lm_datasets = load_arc_c_streaming_dataset(
+                tokenizer=tokenizer,
+                split="train",
+                block_size=block_size,
+                debug_mode=training_args.debug_mode,
+                dataset_name="ARC-Challenge",
+                answer_with_text=True,   # or False if you want only A/B/C/D
+            )
+
+    else:
+        with training_args.main_process_first(desc="dataset map tokenization and grouping"):
+            lm_datasets = load_streaming_datasets(
+                data_args.dataset_dir,
+                tokenizer=tokenizer,
+                text_field=getattr(data_args, "text_field", "text"),
+                prob_map=data_args.prob_map,
+                num_proc=data_args.preprocessing_num_workers,
+                debug_mode=training_args.debug_mode,
+                block_size=block_size,
+            )
 
 
     if training_args.do_train:
@@ -284,9 +320,21 @@ def main():
         if data_args.max_train_samples is None:
             raise ValueError("max_train_samples cannot be None")
         logger.info("training example:")
-        logger.info(
-            tokenizer.decode([x["input_ids"] for x in train_dataset.take(1)][0])
-        )
+        sample = next(iter(train_dataset.take(1)))
+
+        if data_args.dataset_name in ARC_DATASET_NAMES:
+            logger.info(f"Sample keys: {list(sample.keys())}")
+            logger.info(f"correct_idx: {sample['correct_idx']}")
+            logger.info(f"num_choices: {len(sample['input_ids'])}")
+
+            for i, (ids, labels) in enumerate(zip(sample["input_ids"], sample["labels"])):
+                decoded = tokenizer.decode(ids, skip_special_tokens=False)
+                supervised = sum(1 for x in labels if x != -100)
+                prefix = ">>" if i == sample["correct_idx"] else "  "
+                logger.info(f"{prefix} choice {i} | len={len(ids)} | supervised_tokens={supervised}")
+                logger.info(decoded)
+        else:
+            logger.info(tokenizer.decode(sample["input_ids"], skip_special_tokens=False))
 
     eval_dataset = None
     if training_args.do_eval:
@@ -328,7 +376,7 @@ def main():
         #     model.change_moe_gate_add_noise(False)
         #     model.change_moe_gate_use_balance(False)
         replace_xformers(model)
-        dump_gate_settings(model, logger)
+        # dump_gate_settings(model, logger)
     else:
         model = AutoModelForCausalLM.from_config(config)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
@@ -368,19 +416,45 @@ def main():
     #     if m.__class__.__name__ == "DynamicTopGate":
     #         m.register_forward_hook(gate_hook)
 
-    if training_args.should_save:
+    if training_args.should_save and checkpoint is None:
         save_router_lora(model, training_args.output_dir, filename="router_lora_init.pt")
 
     get_trainable_parameters(model, verbose=True)
 
     # Initialize our Trainer
+    if data_args.dataset_name == "lambada":
+        data_collator = FaultTolerantCausalLMCollator(
+            pad_token_id=tokenizer.pad_token_id
+        )
+    elif data_args.dataset_name in ARC_DATASET_NAMES:
+        data_collator = FaultTolerantMultipleChoiceCollator(
+            pad_token_id=tokenizer.pad_token_id
+        )
+    else:
+        data_collator = fault_tolerance_data_collator
+        
+    if training_args.do_train and data_args.dataset_name in ARC_DATASET_NAMES:
+        sample = next(iter(train_dataset.take(1)))
+        print("ARC-C sample keys:", sample.keys())
+        print("num choices:", len(sample["input_ids"]))
+        print("choice lens:", [len(x) for x in sample["input_ids"]])
+        print("correct_idx:", sample["correct_idx"])
+        
+    if training_args.do_train and data_args.dataset_name in ARC_DATASET_NAMES:
+        batch_feats = list(train_dataset.take(2))
+        batch = data_collator(batch_feats)
+        print("input_ids shape:", batch["input_ids"].shape)         # [B, C, L]
+        print("attention_mask shape:", batch["attention_mask"].shape)
+        print("labels shape:", batch["labels"].shape)
+        print("correct_idx shape:", batch["correct_idx"].shape)
+        
     trainer = LlamaLrSchedulingTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        data_collator=fault_tolerance_data_collator,
+        data_collator=data_collator,
         compute_metrics=None,
         preprocess_logits_for_metrics=None,
     )
@@ -389,11 +463,29 @@ def main():
 
     # Training
     if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
+        checkpoint = training_args.resume_from_checkpoint or last_checkpoint
+        start_step = step_from_checkpoint(checkpoint) if checkpoint else 0
+        print(f"Resuming from checkpoint: {checkpoint}, start_step: {start_step}")
+
+        if checkpoint is not None:
+            ckpt_adapter = os.path.join(checkpoint, "router_lora.pt")
+            if os.path.isfile(ckpt_adapter):
+                print(f"[ADAPTER RESUME] Loading router LoRA from {ckpt_adapter}")
+                state = torch.load(ckpt_adapter, map_location="cpu")
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                print(f"[ADAPTER RESUME] missing={len(missing)} unexpected={len(unexpected)}")
+            else:
+                print(f"[ADAPTER RESUME] No router_lora.pt found at {ckpt_adapter}, starting fresh.")
+        
+        # if start_step:
+        #     remaining = max(training_args.max_steps - start_step, 0)
+        #     if remaining == 0:
+        #         remaining = training_args.max_steps
+        #     print(f"[ADAPTER RESUME] start_step={start_step}, remaining_steps={remaining}")
+
+        #     # override max_steps to remaining
+        #     training_args.max_steps = remaining
+
             
         # Write run hyperparams once (DDP-safe)
         is_world_zero = int(getattr(training_args, "process_index", 0)) == 0
@@ -410,9 +502,9 @@ def main():
                     }
                 },
             )
-            logger.info(f"Wrote run hyperparams to {training_args.output_dir}/run_hparams.json")
+            print(f"Wrote run hyperparams to {training_args.output_dir}/run_hparams.json")
         
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        train_result = trainer.train()
 
         metrics = train_result.metrics
         metrics["train_samples"] = data_args.max_train_samples

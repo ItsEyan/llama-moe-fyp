@@ -670,7 +670,6 @@ class DynamicTopGate(nn.Module):
             for e, count in items:
                 logging.info(f"    expert={e:>2d}: {count:>8d} ({100.0*count/total_e:5.2f}%)")
 
-
     def _print_topp_extra(self, top_probs):
         cum = torch.cumsum(top_probs, dim=1)
         p_at_2 = cum[:, 1] if top_probs.size(1) > 1 else top_probs[:, 0]
@@ -1031,6 +1030,10 @@ class DynamicTopGate(nn.Module):
         probs_full = torch.softmax(logits_t.float(), dim=1).to(logits_t.dtype)
 
         top_indices, top_scores, top_mask, k_vec = self._dynamic_select(logits_t)
+        
+        # self._cache_router_logits = logits
+        # self._cache_router_probs = probs
+        # self._cache_topk_idx = topk_idx
 
         # importance/load
         B, E = logits.shape

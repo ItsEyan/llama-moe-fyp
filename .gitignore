@@ -163,7 +163,6 @@ debug.py
 debug.txt
 debug.png
 resources/
-outputs/
 /backups/
 /visualization/
 results/
@@ -178,4 +177,4 @@ smoe/entrypoint/analysis/gating_*.py
 models/
 topp_debug.txt
 data/
-llama-moe/LLaMA-MoE-v1-3_5B-4_16
+*pytorch_model-*

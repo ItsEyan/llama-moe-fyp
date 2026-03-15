@@ -1,8 +1,11 @@
-from typing import List, Optional
+from tkinter.filedialog import test
+from typing import Dict, Any, List, Optional
 import torch
+import torch.nn as nn
 import time
 import threading
 from datasets import load_dataset
+from dataclasses import asdict
 from tqdm import tqdm
 from dataclasses import dataclass
 from torch.profiler import profile, ProfilerActivity
@@ -17,6 +20,118 @@ class RunStats:
     processed_tokens: int = 0     # tokens model processed in forwards (prefix + suffix, all options)
     supervised_tokens: int = 0    # tokens we actually supervised/scored (e.g., only suffix)
     generated_tokens: int = 0     # for generative tasks (BoolQ)
+
+@dataclass
+class RouterStats:
+    mean_k: float = float("nan")
+    mean_entropy_full: float = float("nan")
+    mean_entropy_selected: float = float("nan")
+    total_tokens: int = 0
+    total_gate_calls: int = 0
+    k_hist: Dict[str, int] = None
+
+class GateStatsCollector:
+    def __init__(self, model: nn.Module, gate_class_name: str = "DynamicTopGate"):
+        self.model = model
+        self.gate_class_name = gate_class_name
+        self.hooks = []
+        self.reset()
+
+    def reset(self):
+        self._sum_k = 0.0
+        self._sum_ent_full = 0.0
+        self._sum_ent_sel = 0.0
+        self._tok_full = 0
+        self._tok_sel = 0
+        self._total_tokens = 0
+        self._gate_calls = 0
+        self._k_hist = {}
+
+    @staticmethod
+    def _entropy(p: torch.Tensor) -> torch.Tensor:
+        p = p.clamp_min(1e-12)
+        return -(p * p.log()).sum(dim=-1)
+
+    def _hook_fn(self, module: nn.Module, inp, out):
+        if not isinstance(out, dict):
+            return
+
+        k_vec = out.get("k_vec", None)
+        if k_vec is not None:
+            B = int(k_vec.numel())
+            self._sum_k += float(k_vec.float().sum().item())
+            self._total_tokens += B
+
+            kv = k_vec.detach().to(torch.int64).cpu()
+            binc = torch.bincount(kv, minlength=128)
+            for k, c in enumerate(binc.tolist()):
+                if c:
+                    self._k_hist[k] = self._k_hist.get(k, 0) + int(c)
+
+        p_full = out.get("probs_full", None)
+        if p_full is not None:
+            H = self._entropy(p_full.float())
+            self._sum_ent_full += float(H.sum().item())
+            self._tok_full += int(H.numel())
+
+        top_scores = out.get("topK_scores", None)
+        top_mask = out.get("topK_mask", None)
+        if top_scores is not None and top_mask is not None:
+            s = top_scores.float() * top_mask.float()
+            z = s.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            p_sel = s / z
+            Hs = self._entropy(p_sel)
+            self._sum_ent_sel += float(Hs.sum().item())
+            self._tok_sel += int(Hs.numel())
+
+        self._gate_calls += 1
+
+    def attach(self):
+        self.detach()
+        for m in self.model.modules():
+            if m.__class__.__name__ == self.gate_class_name:
+                self.hooks.append(m.register_forward_hook(self._hook_fn))
+
+    def detach(self):
+        for h in self.hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self.hooks = []
+
+    def summarize(self) -> RouterStats:
+        stats = RouterStats()
+        stats.total_tokens = int(self._total_tokens)
+        stats.total_gate_calls = int(self._gate_calls)
+
+        if self._total_tokens > 0:
+            stats.mean_k = float(self._sum_k / self._total_tokens)
+
+        if self._tok_full > 0:
+            stats.mean_entropy_full = float(self._sum_ent_full / self._tok_full)
+
+        if self._tok_sel > 0:
+            stats.mean_entropy_selected = float(self._sum_ent_sel / self._tok_sel)
+
+        stats.k_hist = {str(k): int(v) for k, v in sorted(self._k_hist.items()) if v > 0}
+        return stats
+    
+def run_single_eval_with_stats(model, eval_fn):
+    collector = GateStatsCollector(model)
+    collector.attach()
+    collector.reset()
+
+    with torch.no_grad():
+        metrics = eval_fn()
+
+    router_stats = asdict(collector.summarize())
+    collector.detach()
+
+    return {
+        "router_stats": router_stats,
+        "metrics": metrics,
+    }
 
 def integrate_gpu_energy_joules(fn, poll_ms=10, device_index=0):
     """
@@ -81,7 +196,6 @@ def _report_energy(
     J_per_token_sup  = energy_J / max(1, res.supervised_tokens) if res.supervised_tokens else float("nan")
     Wh_per_1k_proc   = (Wh / max(1, res.processed_tokens)) * 1000.0 if res.processed_tokens else float("nan")
     Wh_per_1k_sup    = (Wh / max(1, res.supervised_tokens)) * 1000.0 if res.supervised_tokens else float("nan")
-    
     J_per_example = energy_J / max(1, res.total) if res.total else float("nan")
 
     print("\n=== Evaluation Summary ===")
@@ -97,11 +211,10 @@ def _report_energy(
     else:
         print(f"J/token (proc): {J_per_token_proc:.3f} | Wh/1k tok (proc): {Wh_per_1k_proc:.3f}")
 
-    # ---- FLOPs summary ----
     if flops_info and flops_info.get("total_flops_forward") is not None:
         fi = flops_info
         print(
-            f"[FLOPs] Forward (first batch): {fi['total_flops_forward']/1e12:.3f} TFLOPs "
+            f"[FLOPs] Forward (profiled batches): {fi['total_flops_forward']/1e12:.3f} TFLOPs "
             f"(~{fi['flops_per_token_forward']:.0f} FLOPs/token over {fi['profiled_batch_tokens']} tokens)"
         )
         approx_total_flops_eval = fi["flops_per_token_forward"] * max(1, res.processed_tokens)
@@ -110,32 +223,26 @@ def _report_energy(
             f"{energy_J / max(1, approx_total_flops_eval / 1e12):.3f} J / TFLOP"
         )
 
-    # ---- MoE expert activation histogram ----
-    try:
-        from smoe.modules.moe.moe_gates import global_hist
-    except Exception:
-        global_hist = {}
-    
-    try:
-        from smoe.modules.moe.moe_gates import global_expert_hist
-    except Exception:
-        global_expert_hist = {}
-
-    sorted_hist = dict(sorted(global_hist.items()))
-    total_h = sum(sorted_hist.values())
-    if sorted_hist:
-        print("\n=== Accumulated k-per-token Histogram ===")
-        for k, count in sorted_hist.items():
-            pct = (count / total_h * 100.0) if total_h else 0.0
-            print(f"k={k:>2d}: {count:>8d}  ({pct:.2f}%)")
-
-    sorted_ehist = dict(sorted(global_expert_hist.items()))
-    total_e = sum(sorted_ehist.values())
-    if sorted_ehist:
-        print("\n=== Accumulated Expert Activation Histogram ===")
-        for e, count in sorted_ehist.items():
-            pct = (count / total_e * 100.0) if total_e else 0.0
-            print(f"expert={e:>2d}: {count:>8d}  ({pct:.2f}%)")
+    return {
+        "task_name": task_name,
+        "num_examples": res.total,
+        "accuracy": acc,
+        "time_s": sec,
+        "avg_gpu_power_W": avg_W,
+        "energy_J": energy_J,
+        "energy_Wh": Wh,
+        "energy_per_example_J": J_per_example,
+        "processed_tokens": res.processed_tokens,
+        "supervised_tokens": res.supervised_tokens,
+        "generated_tokens": res.generated_tokens,
+        "proc_tokens_per_s": tokps_proc,
+        "gen_tokens_per_s": tokps_gen,
+        "J_per_token_proc": J_per_token_proc,
+        "J_per_token_sup": J_per_token_sup,
+        "Wh_per_1k_proc": Wh_per_1k_proc,
+        "Wh_per_1k_sup": Wh_per_1k_sup,
+        "flops_info": flops_info if flops_info else None,
+    }
 
 
 
@@ -157,9 +264,14 @@ __all__ = [
 # ----------------------------
 # Shared helpers (no model state)
 # ----------------------------
-def _pad_batch_texts(tokenizer, device, texts: List[str], max_len: int = 1024):
+def _pad_batch_texts(tokenizer, device, texts: List[str], max_len: int = 1024, add_special_tokens: bool = True):
     return tokenizer(
-        texts, return_tensors="pt", padding=True, truncation=True, max_length=max_len
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+        add_special_tokens=add_special_tokens,
     ).to(device)
 
 @torch.no_grad()
@@ -220,80 +332,78 @@ def _sum_logprobs_for_suffix(
         scores.append(tgt_logp.masked_select(mask).view(B, -1).sum(dim=1))
 
     return torch.stack(scores, dim=1), processed_tokens, supervised_tokens
-
-def _collect_flops_once(
+    
+def collect_flops_over_batches(
     task_name: str,
     model,
-    forward_kwargs: dict,
-    flops_info: dict,
+    batches: list[dict],
     sort_by: str = "self_cuda_time_total",
-    row_limit: int = 60,
+    row_limit: int = 40,
 ):
-    """
-    Profiles a single forward pass, prints a CPU/CUDA table, and fills `flops_info` with:
-      - total_flops_forward
-      - flops_per_token_forward
-      - profiled_batch_tokens
-    Works on CPU-only and on torch builds without `with_flops` (falls back gracefully).
-    """
+    model.eval()
 
-    # Warmup to reduce kernel-init noise
-    _ = model(**forward_kwargs, use_cache=False, return_dict=True)
+    activities = [ProfilerActivity.CPU]
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        activities.append(ProfilerActivity.CUDA)
 
-    activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if torch.cuda.is_available() else [])
+    total_flops_all = 0
+    total_tokens_all = 0
+    per_batch_flops_per_token = []
+    with_flops_ok = True
 
-    # Try with FLOPs; if not supported, retry without.
-    try:
-        with profile(activities=activities, record_shapes=True, with_flops=True) as prof:
-            _ = model(**forward_kwargs, use_cache=False, return_dict=True)
+    # warmup
+    with torch.inference_mode():
+        for warmup_batch in batches[:2]:
+            _ = model(**warmup_batch, use_cache=False, return_dict=True)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-        with_flops_ok = True
-    except TypeError:
-        with profile(activities=activities, record_shapes=True) as prof:
-            _ = model(**forward_kwargs, use_cache=False, return_dict=True)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        with_flops_ok = False
 
-    # Robust table print
-    print(f"\n=== PyTorch Profiler (first batch) — {task_name} ===")
-    table_str = None
-    try:
-        table_str = prof.key_averages().table(sort_by=sort_by, row_limit=row_limit)
-    except Exception:
-        # Try common alternates; then default
-        for key in ("cuda_time_total", "self_cpu_time_total", "cpu_time_total"):
+    for i, forward_kwargs in enumerate(batches):
+        with torch.inference_mode():
             try:
-                table_str = prof.key_averages().table(sort_by=key, row_limit=row_limit)
-                break
-            except Exception:
-                continue
-        if table_str is None:
-            try:
-                table_str = prof.key_averages().table(row_limit=row_limit)
-            except Exception as e:
-                table_str = f"[Profiler table unavailable: {e}]"
-    print(table_str)
+                with profile(activities=activities, record_shapes=True, with_flops=True) as prof:
+                    _ = model(**forward_kwargs, use_cache=False, return_dict=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+            except TypeError:
+                with_flops_ok = False
+                with profile(activities=activities, record_shapes=True) as prof:
+                    _ = model(**forward_kwargs, use_cache=False, return_dict=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
 
-    # Aggregate FLOPs summary (if available)
-    total_flops = 0
-    if with_flops_ok:
-        try:
+        # if i == 0:
+        #     print(f"\n=== PyTorch Profiler sample — {task_name} ===")
+        #     try:
+        #         print(prof.key_averages().table(sort_by=sort_by, row_limit=row_limit))
+        #     except Exception:
+        #         print(prof.key_averages().table(row_limit=row_limit))
+
+        batch_flops = 0
+        if with_flops_ok:
             for e in prof.key_averages():
-                total_flops += (getattr(e, "flops", 0) or 0)
-        except Exception:
-            total_flops = 0
+                batch_flops += (getattr(e, "flops", 0) or 0)
 
-    # Normalize by tokens if present
-    inp = forward_kwargs.get("input_ids")
-    num_tokens = int(inp.numel()) if torch.is_tensor(inp) else 0
+        input_ids = forward_kwargs.get("input_ids")
+        batch_tokens = int(input_ids.numel()) if torch.is_tensor(input_ids) else 0
 
-    flops_info["total_flops_forward"] = total_flops or None
-    flops_info["flops_per_token_forward"] = (total_flops / max(1, num_tokens)) if (total_flops and num_tokens) else None
-    flops_info["profiled_batch_tokens"] = num_tokens or None
+        if batch_flops and batch_tokens:
+            total_flops_all += batch_flops
+            total_tokens_all += batch_tokens
+            per_batch_flops_per_token.append(batch_flops / batch_tokens)
+
+    return {
+        "total_flops_forward": total_flops_all or None,
+        "profiled_batch_tokens": total_tokens_all or None,
+        "flops_per_token_forward": (
+            total_flops_all / total_tokens_all if total_flops_all and total_tokens_all else None
+        ),
+        "flops_per_token_batch_mean": (
+            sum(per_batch_flops_per_token) / len(per_batch_flops_per_token)
+            if per_batch_flops_per_token else None
+        ),
+        "num_profiled_batches": len(per_batch_flops_per_token),
+    }
 
 # =========================================================
 # Evaluations (each takes: model, tokenizer, device, energy_fn)
@@ -301,26 +411,17 @@ def _collect_flops_once(
 # =========================================================
 
 # ---------- BoolQ ----------
-@torch.no_grad()
-def eval_boolq(model, tokenizer, device, max_eval: int = 1024, batch_size: int = 8, collect_flops: bool = True):
-    """
-    BoolQ evaluation via conditional log-likelihood:
-      score(" Yes" | prefix) vs score(" No" | prefix), choose higher.
+def profile_boolq_flops(model, tokenizer, device, subset, batch_size=8, num_profile_batches=5):
+    model.eval()
 
-    Tracks processed_tokens (all prefix+suffix tokens fed to the model)
-    and supervised_tokens (suffix tokens actually scored).
-    """
-    ds = load_dataset("google/boolq")
-    val_ds = ds["validation"]
-    subset = val_ds if (max_eval == -1 or max_eval >= len(val_ds)) else val_ds.select(
-        range(min(max_eval, len(val_ds)))
-    )
+    flops_batches = []
+
+    old_trunc_side = tokenizer.truncation_side
+    tokenizer.truncation_side = "left"
 
     PROMPT_TMPL = (
-        "You are a precise assistant answering Yes/No using the passage.\n"
         "Passage: {passage}\n"
         "Question: {question}\n"
-        "Answer with a single word: Yes or No.\n"
         "Answer: "
     )
 
@@ -330,72 +431,210 @@ def eval_boolq(model, tokenizer, device, max_eval: int = 1024, batch_size: int =
             for p, q in zip(batch["passage"], batch["question"])
         ]
 
+    try:
+        for i in range(0, min(len(subset), batch_size * num_profile_batches), batch_size):
+            batch = subset[i:i+batch_size]
+            prefixes = make_batch_prefixes(batch)
+
+            enc = tokenizer(
+                prefixes,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1024,
+                add_special_tokens=True,
+            ).to(device)
+
+            flops_batches.append({
+                "input_ids": enc["input_ids"],
+                "attention_mask": enc["attention_mask"],
+            })
+
+        return collect_flops_over_batches(
+            task_name="BoolQ (prompt only)",
+            model=model,
+            batches=flops_batches,
+            sort_by="self_cuda_time_total",
+        )
+    finally:
+        tokenizer.truncation_side = old_trunc_side
+
+@torch.no_grad()
+def eval_boolq(
+    model,
+    tokenizer,
+    device,
+    max_eval: int = 1024,
+    batch_size: int = 8,
+    collect_flops: bool = True,
+):
+    """
+    BoolQ evaluation via next-token logits:
+      compare logit("Yes") vs logit("No") after the prompt.
+
+    This avoids suffix concatenation issues.
+    Assumes "Yes" and "No" are single tokens for the tokenizer.
+    """
+
+    ds = load_dataset("google/boolq")
+    val_ds = ds["validation"]
+    subset = val_ds if (max_eval == -1 or max_eval >= len(val_ds)) else val_ds.select(
+        range(min(max_eval, len(val_ds)))
+    )
+
+    # Important for long BoolQ passages:
+    # keep the END of the prompt (question + answer cue) if truncation happens
+    old_trunc_side = tokenizer.truncation_side
+    tokenizer.truncation_side = "left"
+
+    # We already checked these are single-token for your tokenizer
+    yes_ids = tokenizer("Yes", add_special_tokens=False)["input_ids"]
+    no_ids = tokenizer("No", add_special_tokens=False)["input_ids"]
+
+    assert len(yes_ids) == 1, f"'Yes' is not single-token: {yes_ids}"
+    assert len(no_ids) == 1, f"'No' is not single-token: {no_ids}"
+
+    yes_id = yes_ids[0]
+    no_id = no_ids[0]
+
+    flops_info = {}
+
+    # Optional FLOPs profiling on prompt-only forward pass
+    if collect_flops:
+        print("\n=== Profiling FLOPs (separate pass, no energy integration) ===")
+        flops_info = profile_boolq_flops(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            subset=subset,
+            batch_size=batch_size,
+            num_profile_batches=5,
+        )
+
     res_stats = RunStats()
-    flops_info = {"total_flops_forward": None}
 
     def _run():
         total = 0
         correct = 0
         processed_tokens = 0
         supervised_tokens = 0
+        num_yes = 0
+        num_no = 0
 
         pbar = tqdm(range(0, len(subset), batch_size), desc="BoolQ", unit="batch")
-        for bi, i in enumerate(pbar):
+        for i in pbar:
             batch = subset[i:i+batch_size]
 
-            # ----- Build prefixes -----
-            prefixes = make_batch_prefixes(batch)
-            enc_prefix = _pad_batch_texts(tokenizer, device, prefixes)  # dict with input_ids, attention_mask
+            prefixes = [
+                f"Passage: {p}\nQuestion: {q}\nAnswer: "
+                for p, q in zip(batch["passage"], batch["question"])
+            ]
 
-            # ----- Two fixed verbalizers with leading space -----
-            B = enc_prefix["input_ids"].size(0)
-            sfx_yes = _pad_batch_texts(tokenizer, device, [" Yes"] * B)
-            sfx_no  = _pad_batch_texts(tokenizer, device, [" No"]  * B)
-            
-            if collect_flops and bi == 0:
-                inp_full = torch.cat([enc_prefix["input_ids"], sfx_yes["input_ids"]], dim=1)
-                attn_full = torch.cat([enc_prefix["attention_mask"], torch.ones_like(sfx_yes["input_ids"], device=device)], dim=1)
-                _collect_flops_once(
-                    task_name="BoolQ (prefix+suffix)",
-                    model=model,
-                    forward_kwargs={"input_ids": inp_full, "attention_mask": attn_full},
-                    flops_info=flops_info,
-                    sort_by="self_cuda_time_total",
-                )
+            enc = tokenizer(
+                prefixes,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1024,
+                add_special_tokens=True,
+            ).to(device)
 
-
-            # ----- Score suffixes: log p(" Yes" | prefix) vs log p(" No" | prefix) -----
-            scores, pt, st = _sum_logprobs_for_suffix(
-                model, tokenizer, device,
-                enc_prefix["input_ids"],
-                [sfx_yes["input_ids"], sfx_no["input_ids"]],
-                attention_mask_prefix=enc_prefix["attention_mask"]
+            out = model(
+                input_ids=enc["input_ids"],
+                attention_mask=enc["attention_mask"],
+                use_cache=False,
+                return_dict=True,
             )
-            processed_tokens += pt
-            supervised_tokens += st
 
-            # ----- Predictions -----
-            pred_idx = scores.argmax(dim=1).tolist()  # 0 -> " Yes", 1 -> " No"
-            gold = [("yes" if bool(a) else "no") for a in batch["answer"]]
-            for j, p in enumerate(pred_idx):
-                pred = "yes" if p == 0 else "no"
-                correct += int(pred == gold[j])
-            total += len(gold)
+            # Since we use LEFT padding, the final real token is at index -1
+            next_logits = out.logits[:, -1, :]   # [B, vocab]
 
+            yes_scores = next_logits[:, yes_id]
+            no_scores = next_logits[:, no_id]
+
+            pred_is_yes = (yes_scores > no_scores).tolist()
+            gold_is_yes = [bool(a) for a in batch["answer"]]
+
+            processed_tokens += int(enc["attention_mask"].sum().item())
+            supervised_tokens += len(gold_is_yes)   # 1 supervised decision per example
+
+            for py, gy in zip(pred_is_yes, gold_is_yes):
+                pred = "yes" if py else "no"
+                gold = "yes" if gy else "no"
+                correct += int(pred == gold)
+
+                if py:
+                    num_yes += 1
+                else:
+                    num_no += 1
+
+            total += len(gold_is_yes)
             acc = correct / total if total > 0 else 0.0
             pbar.set_postfix(acc=f"{acc*100:.2f}%")
+            # print(f"Batch {i//batch_size+1}: Acc={acc*100:.2f}% | Yes: {num_yes} | No: {num_no}")
 
         res_stats.total = total
         res_stats.correct = correct
-        res_stats.generated_tokens = 0
         res_stats.processed_tokens = processed_tokens
         res_stats.supervised_tokens = supervised_tokens
+        res_stats.generated_tokens = 0
+
         return {"ok": True}
 
-    _, energy_J, avg_W, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
-    _report_energy("BoolQ", res_stats, energy_J, avg_W, sec, flops_info)
+    try:
+        _, energy_J, avg_W, sec = integrate_gpu_energy_joules(
+            _run, poll_ms=10, device_index=0
+        )
+    finally:
+        tokenizer.truncation_side = old_trunc_side
+
+    energy_metrics = _report_energy("BoolQ", res_stats, energy_J, avg_W, sec, flops_info)
+
+    return {
+        "accuracy": res_stats.correct / max(1, res_stats.total),
+        "run_stats": {
+            "total": res_stats.total,
+            "correct": res_stats.correct,
+            "processed_tokens": res_stats.processed_tokens,
+            "supervised_tokens": res_stats.supervised_tokens,
+            "generated_tokens": res_stats.generated_tokens,
+        },
+        "energy": energy_metrics,
+    }
 
 # ---------- PIQA ----------
+
+def profile_piqa_flops(model, tokenizer, device, val, batch_size=16, num_profile_batches=5):
+    model.eval()
+    flops_batches = []
+
+    for i in range(0, min(len(val), batch_size * num_profile_batches), batch_size):
+        batch = val[i:i+batch_size]
+        goals = batch["goal"]
+        sol1 = batch["sol1"]
+
+        prefixes = [f"Goal: {g}\nSelect the best solution.\nSolution:" for g in goals]
+        enc_prefix = _pad_batch_texts(tokenizer, device, prefixes)
+        sfx1 = _pad_batch_texts(tokenizer, device, [" " + s for s in sol1])
+
+        inp0 = torch.cat([enc_prefix["input_ids"], sfx1["input_ids"]], dim=1)
+        attn0 = torch.cat(
+            [enc_prefix["attention_mask"], torch.ones_like(sfx1["input_ids"], device=device)],
+            dim=1
+        )
+
+        flops_batches.append({
+            "input_ids": inp0,
+            "attention_mask": attn0,
+        })
+
+    return collect_flops_over_batches(
+        task_name="PIQA",
+        model=model,
+        batches=flops_batches,
+        sort_by="self_cuda_time_total",
+    )
+
 @torch.no_grad()
 def eval_piqa(model, tokenizer, device, batch_size: int = 16, max_eval: int = -1, collect_flops: bool = True):
     ds = load_dataset("piqa")
@@ -404,8 +643,19 @@ def eval_piqa(model, tokenizer, device, batch_size: int = 16, max_eval: int = -1
         val = val.select(range(min(max_eval, len(val))))
 
     res_stats = RunStats()
-    flops_info = {"total_flops_forward": None}
-    
+    flops_info = {}
+
+    if collect_flops:
+        print("\n=== Profiling FLOPs (PIQA) ===")
+        flops_info = profile_piqa_flops(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            val=val,
+            batch_size=batch_size,
+            num_profile_batches=5,
+        )
+        
     def _run():
         total = 0; correct = 0; proc_tok = 0; sup_tok = 0
 
@@ -420,19 +670,6 @@ def eval_piqa(model, tokenizer, device, batch_size: int = 16, max_eval: int = -1
             enc_prefix = _pad_batch_texts(tokenizer, device, prefixes)
             sfx1 = _pad_batch_texts(tokenizer, device, [" " + s for s in sol1])
             sfx2 = _pad_batch_texts(tokenizer, device, [" " + s for s in sol2])
-
-            # ---- FLOPs on first batch: prefix + option-0 as representative ----
-            if collect_flops and bi == 0:
-                inp0  = torch.cat([enc_prefix["input_ids"], sfx1["input_ids"]], dim=1)
-                attn0 = torch.cat([enc_prefix["attention_mask"],
-                                torch.ones_like(sfx1["input_ids"], device=device)], dim=1)
-                _collect_flops_once(
-                    task_name="PIQA",
-                    model=model,
-                    forward_kwargs={"input_ids": inp0, "attention_mask": attn0},
-                    flops_info=flops_info,
-                    sort_by="self_cuda_time_total",
-                )
 
             scores, pt, st = _sum_logprobs_for_suffix(
                 model, tokenizer, device,
@@ -453,11 +690,85 @@ def eval_piqa(model, tokenizer, device, batch_size: int = 16, max_eval: int = -1
         res_stats.supervised_tokens = sup_tok
         return {"ok": True}
 
-    _, E, Pavg, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
-    _report_energy("PIQA", res_stats, E, Pavg, sec, flops_info)
+    _, energy_J, avg_W, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
+
+    energy_metrics = _report_energy("PIQA", res_stats, energy_J, avg_W, sec, flops_info)
+
+    return {
+        "accuracy": res_stats.correct / max(1, res_stats.total),
+        "run_stats": {
+            "total": res_stats.total,
+            "correct": res_stats.correct,
+            "processed_tokens": res_stats.processed_tokens,
+            "supervised_tokens": res_stats.supervised_tokens,
+            "generated_tokens": res_stats.generated_tokens,
+        },
+        "energy": energy_metrics,
+    }
 
 
 # ---------- HellaSwag ----------
+def profile_hellaswag_flops(model, tokenizer, device, val, batch_size=8, num_profile_batches=5):
+    model.eval()
+    flops_batches = []
+
+    def _batch_len(batch) -> int:
+        if hasattr(batch, "num_rows"):
+            return int(batch.num_rows)
+        if isinstance(batch, dict):
+            for v in batch.values():
+                if isinstance(v, (list, tuple)):
+                    return len(v)
+            return 0
+        return len(batch)
+
+    def _col(batch, name, default, n: int):
+        if hasattr(batch, "column_names") and name in batch.column_names:
+            return batch[name]
+        if isinstance(batch, dict) and name in batch:
+            return batch[name]
+        return default if not callable(default) else default(n)
+
+    max_items = min(len(val), batch_size * num_profile_batches)
+    for i in range(0, max_items, batch_size):
+        batch = val[i:i + batch_size]
+        n = _batch_len(batch)
+        if n == 0:
+            continue
+
+        ctxs = _col(batch, "ctx", None, n)
+        if ctxs is None:
+            ctxs = _col(batch, "context", None, n)
+        if ctxs is None:
+            a = _col(batch, "ctx_a", [""] * n, n)
+            b = _col(batch, "ctx_b", [""] * n, n)
+            ctxs = [(aa + " " + bb).strip() for aa, bb in zip(a, b)]
+
+        ends = _col(batch, "endings", lambda _n: [["", "", "", ""] for _ in range(_n)], n)
+        ends = [list(e) if not isinstance(e, list) else e for e in ends]
+        endings_by_k = list(map(list, zip(*ends)))
+
+        enc_ctx = _pad_batch_texts(tokenizer, device, ctxs)
+        suffix0 = _pad_batch_texts(tokenizer, device, [" " + e for e in endings_by_k[0]])
+
+        inp0 = torch.cat([enc_ctx["input_ids"], suffix0["input_ids"]], dim=1)
+        attn0 = torch.cat(
+            [enc_ctx["attention_mask"], torch.ones_like(suffix0["input_ids"], device=device)],
+            dim=1
+        )
+
+        flops_batches.append({
+            "input_ids": inp0,
+            "attention_mask": attn0,
+        })
+
+    return collect_flops_over_batches(
+        task_name="HellaSwag",
+        model=model,
+        batches=flops_batches,
+        sort_by="self_cuda_time_total",
+    )
+
 @torch.no_grad()
 def eval_hellaswag(
     model, tokenizer, device, batch_size: int = 8, max_eval: int = -1, collect_flops: bool = True
@@ -466,6 +777,20 @@ def eval_hellaswag(
     val = ds["validation"]
     if max_eval != -1:
         val = val.select(range(min(max_eval, len(val))))
+        
+    res_stats = RunStats()
+    flops_info = {}
+
+    if collect_flops:
+        print("\n=== Profiling FLOPs (HellaSwag) ===")
+        flops_info = profile_hellaswag_flops(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            val=val,
+            batch_size=batch_size,
+            num_profile_batches=5,
+        )
 
     # small helpers so we work with either a Dataset slice or a dict-of-lists
     def _batch_len(batch) -> int:
@@ -484,9 +809,6 @@ def eval_hellaswag(
         if isinstance(batch, dict) and name in batch:
             return batch[name]
         return default if not callable(default) else default(n)
-
-    res_stats = RunStats()
-    flops_info = {"total_flops_forward": None}
 
     def _run():
         total = 0
@@ -530,21 +852,6 @@ def eval_hellaswag(
                 for k in range(K)
             ]
 
-            # ---- FLOPs on first batch: ctx + option-0 as representative ----
-            if collect_flops and bi == 0:
-                inp0  = torch.cat([enc_ctx["input_ids"], suffix_batches[0]["input_ids"]], dim=1)
-                attn0 = torch.cat(
-                    [enc_ctx["attention_mask"], torch.ones_like(suffix_batches[0]["input_ids"], device=device)],
-                    dim=1
-                )
-                _collect_flops_once(
-                    task_name="HellaSwag",
-                    model=model,
-                    forward_kwargs={"input_ids": inp0, "attention_mask": attn0},
-                    flops_info=flops_info,
-                    sort_by="self_cuda_time_total",
-                )
-
             # ---- score options ----
             scores, pt, st = _sum_logprobs_for_suffix(
                 model, tokenizer, device,
@@ -565,12 +872,113 @@ def eval_hellaswag(
         res_stats.processed_tokens = proc_tok
         res_stats.supervised_tokens = sup_tok
         return {"ok": True}
+    
+    _, energy_J, avg_W, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
 
-    _, E, Pavg, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
-    _report_energy("HellaSwag", res_stats, E, Pavg, sec, flops_info)
+    energy_metrics = _report_energy("HellaSwag", res_stats, energy_J, avg_W, sec, flops_info)
+
+    return {
+        "accuracy": res_stats.correct / max(1, res_stats.total),
+        "run_stats": {
+            "total": res_stats.total,
+            "correct": res_stats.correct,
+            "processed_tokens": res_stats.processed_tokens,
+            "supervised_tokens": res_stats.supervised_tokens,
+            "generated_tokens": res_stats.generated_tokens,
+        },
+        "energy": energy_metrics,
+    }
 
 
-# ---------- ARC (Easy/Challenge) — robust batch handling + FLOPs ----------
+# ---------- ARC (Easy/Challenge) — robust batch handling ----------
+def profile_arc_flops(model, tokenizer, device, val, subset_name="ARC-Challenge", batch_size=8, num_profile_batches=5):
+    model.eval()
+    flops_batches = []
+
+    def _batch_len(batch) -> int:
+        if hasattr(batch, "num_rows"):
+            return int(batch.num_rows)
+        if isinstance(batch, dict):
+            for v in batch.values():
+                if isinstance(v, (list, tuple)):
+                    return len(v)
+            return 0
+        return len(batch)
+
+    def _col(batch, name, default, n: int):
+        if hasattr(batch, "column_names") and name in batch.column_names:
+            return batch[name]
+        if isinstance(batch, dict) and name in batch:
+            return batch[name]
+        return default if not callable(default) else default(n)
+
+    max_items = min(len(val), batch_size * num_profile_batches)
+    for bi in range(0, max_items, batch_size):
+        batch = val[bi:bi+batch_size]
+        n = _batch_len(batch)
+        if n == 0:
+            continue
+
+        questions = _col(batch, "question", [""] * n, n)
+        choices = _col(batch, "choices", None, n)
+
+        row_texts, row_labels = [], []
+        if isinstance(choices, dict):
+            text_cols = choices.get("text", [[]] * n)
+            label_cols = choices.get("label", [[]] * n)
+            for i in range(n):
+                row_texts.append(list(text_cols[i]))
+                row_labels.append(list(label_cols[i]))
+        elif isinstance(choices, list):
+            for i in range(n):
+                ch_i = choices[i] or {}
+                row_texts.append(list(ch_i.get("text", [])))
+                row_labels.append(list(ch_i.get("label", [])))
+        else:
+            row_texts = [[] for _ in range(n)]
+            row_labels = [[] for _ in range(n)]
+
+        prompts = []
+        Kmax = 0
+        for i in range(n):
+            texts_i = row_texts[i]
+            labels_i = row_labels[i]
+            Kmax = max(Kmax, len(texts_i))
+            opt_lines = [f"{labels_i[j]}. {texts_i[j]}" for j in range(len(texts_i))]
+            prompt = "Question: " + questions[i] + "\n" + "\n".join(opt_lines) + "\nAnswer:"
+            prompts.append(prompt)
+
+        if Kmax == 0:
+            continue
+
+        enc = _pad_batch_texts(tokenizer, device, prompts)
+
+        opts0 = []
+        for i in range(n):
+            if len(row_texts[i]) > 0:
+                opts0.append(" " + row_texts[i][0])
+            else:
+                opts0.append(" [N/A]")
+        option0 = _pad_batch_texts(tokenizer, device, opts0)["input_ids"]
+
+        inp0 = torch.cat([enc["input_ids"], option0], dim=1)
+        attn0 = torch.cat(
+            [enc["attention_mask"], torch.ones_like(option0, device=device)],
+            dim=1
+        )
+
+        flops_batches.append({
+            "input_ids": inp0,
+            "attention_mask": attn0,
+        })
+
+    return collect_flops_over_batches(
+        task_name=subset_name,
+        model=model,
+        batches=flops_batches,
+        sort_by="self_cuda_time_total",
+    )
+    
 @torch.no_grad()
 def eval_arc(
     model, tokenizer, device, subset: str = "ARC-Challenge", batch_size: int = 8, max_eval: int = -1, collect_flops: bool = True
@@ -579,6 +987,21 @@ def eval_arc(
     val = ds["validation"]
     if max_eval != -1:
         val = val.select(range(min(max_eval, len(val))))
+        
+    res_stats = RunStats()
+    flops_info = {}
+
+    if collect_flops:
+        print(f"\n=== Profiling FLOPs ({subset}) ===")
+        flops_info = profile_arc_flops(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            val=val,
+            subset_name=subset,
+            batch_size=batch_size,
+            num_profile_batches=5,
+        )
 
     # helpers to handle Dataset slices OR dict-of-lists
     def _batch_len(batch) -> int:
@@ -597,9 +1020,6 @@ def eval_arc(
         if isinstance(batch, dict) and name in batch:
             return batch[name]
         return default if not callable(default) else default(n)
-
-    res_stats = RunStats()
-    flops_info = {"total_flops_forward": None}
 
     def _run():
         total = 0; correct = 0; proc_tok = 0; sup_tok = 0
@@ -676,21 +1096,6 @@ def eval_arc(
                         opts_k.append(" [N/A]")
                 option_tensors.append(_pad_batch_texts(tokenizer, device, opts_k)["input_ids"])
 
-            # FLOPs on first batch: prompt + first option as representative
-            if collect_flops and bi == 0 and Kmax > 0:
-                inp0  = torch.cat([enc["input_ids"], option_tensors[0]], dim=1)
-                attn0 = torch.cat(
-                    [enc["attention_mask"], torch.ones_like(option_tensors[0], device=device)],
-                    dim=1
-                )
-                _collect_flops_once(
-                    task_name=subset,
-                    model=model,
-                    forward_kwargs={"input_ids": inp0, "attention_mask": attn0},
-                    flops_info=flops_info,
-                    sort_by="self_cuda_time_total",
-                )
-
             # score options
             scores, pt, st = _sum_logprobs_for_suffix(
                 model, tokenizer, device,
@@ -716,26 +1121,110 @@ def eval_arc(
         res_stats.supervised_tokens = sup_tok
         return {"ok": True}
 
-    _, E, Pavg, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
-    _report_energy(subset, res_stats, E, Pavg, sec, flops_info)
+    _, energy_J, avg_W, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
+
+    energy_metrics = _report_energy(subset, res_stats, energy_J, avg_W, sec, flops_info)
+
+    return {
+        "accuracy": res_stats.correct / max(1, res_stats.total),
+        "run_stats": {
+            "total": res_stats.total,
+            "correct": res_stats.correct,
+            "processed_tokens": res_stats.processed_tokens,
+            "supervised_tokens": res_stats.supervised_tokens,
+            "generated_tokens": res_stats.generated_tokens,
+        },
+        "energy": energy_metrics,
+    }
 
 
-# ---------- LAMBADA (robust batch handling + FLOPs) ----------
+# ---------- LAMBADA (robust batch handling) ----------
+def profile_lambada_flops(model, tokenizer, device, data, batch_size=16, max_len=1024, num_profile_batches=5):
+    model.eval()
+    flops_batches = []
+
+    def _batch_len(batch) -> int:
+        if hasattr(batch, "num_rows"):
+            return int(batch.num_rows)
+        if isinstance(batch, dict):
+            for v in batch.values():
+                if isinstance(v, (list, tuple)):
+                    return len(v)
+            return 0
+        return len(batch)
+
+    def _col(batch, name, default, n: int):
+        if hasattr(batch, "column_names") and name in batch.column_names:
+            return batch[name]
+        if isinstance(batch, dict) and name in batch:
+            return batch[name]
+        return default if not callable(default) else default(n)
+
+    def _split_ctx_target(text: str) -> tuple[str, str]:
+        s = (text or "").strip()
+        parts = s.rsplit(" ", 1)
+        if len(parts) == 1:
+            return "", parts[0]
+        return parts[0], parts[1]
+
+    max_items = min(len(data), batch_size * num_profile_batches)
+    for bi in range(0, max_items, batch_size):
+        batch = data[bi:bi + batch_size]
+        n = _batch_len(batch)
+        if n == 0:
+            continue
+
+        texts = _col(batch, "text", None, n)
+        if texts is None:
+            texts = _col(batch, "sentence", [""] * n, n)
+
+        ctxs, _ = zip(*[_split_ctx_target(t) for t in texts])
+
+        enc = tokenizer(
+            list(ctxs),
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_len
+        ).to(device)
+
+        flops_batches.append({
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+        })
+
+    return collect_flops_over_batches(
+        task_name="LAMBADA",
+        model=model,
+        batches=flops_batches,
+        sort_by="self_cuda_time_total",
+    )
+    
 @torch.no_grad()
 def eval_lambada(
     model, tokenizer, device, batch_size: int = 16, max_eval: int = 5000, max_len: int = 1024, collect_flops: bool = True
 ):
-    # Try common sources
-    try:
-        ds = load_dataset("EleutherAI/lambada_open")
-        split = "test"
-    except Exception:
-        ds = load_dataset("lambada")
-        split = "test"
+    ds = load_dataset("lambada")
+    split = "test"
 
     data = ds[split]
     if max_eval != -1:
         data = data.select(range(min(max_eval, len(data))))
+        
+    res_stats = RunStats()
+    flops_info = {}
+
+    if collect_flops:
+        print("\n=== Profiling FLOPs (LAMBADA) ===")
+        flops_info = profile_lambada_flops(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            data=data,
+            batch_size=batch_size,
+            max_len=max_len,
+            num_profile_batches=5,
+        )
 
     # Helpers to handle Dataset slices OR dict-of-lists
     def _batch_len(batch) -> int:
@@ -762,9 +1251,6 @@ def eval_lambada(
             return "", parts[0]
         return parts[0], parts[1]
 
-    res_stats = RunStats()
-    flops_info = {"total_flops_forward": None}
-
     def _run():
         total = 0
         correct = 0
@@ -787,16 +1273,6 @@ def eval_lambada(
                             truncation=True, max_length=max_len).to(device)
             proc_tok += _sequence_token_count(enc["input_ids"])
 
-            # ---- FLOPs on first batch: plain forward over the context ----
-            if collect_flops and bi == 0:
-                _collect_flops_once(
-                    task_name="LAMBADA",
-                    model=model,
-                    forward_kwargs={"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]},
-                    flops_info=flops_info,
-                    sort_by="self_cuda_time_total",
-                )
-
             out = model(**enc, use_cache=False, return_dict=True)
             logits = out.logits[:, -1, :]
             pred_ids = logits.argmax(dim=-1)
@@ -817,5 +1293,18 @@ def eval_lambada(
         res_stats.processed_tokens = proc_tok
         return {"ok": True}
 
-    _, E, Pavg, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
-    _report_energy("LAMBADA", res_stats, E, Pavg, sec, flops_info)
+    _, energy_J, avg_W, sec = integrate_gpu_energy_joules(_run, poll_ms=10, device_index=0)
+
+    energy_metrics = _report_energy("LAMBADA", res_stats, energy_J, avg_W, sec, flops_info)
+
+    return {
+        "accuracy": res_stats.correct / max(1, res_stats.total),
+        "run_stats": {
+            "total": res_stats.total,
+            "correct": res_stats.correct,
+            "processed_tokens": res_stats.processed_tokens,
+            "supervised_tokens": res_stats.supervised_tokens,
+            "generated_tokens": res_stats.generated_tokens,
+        },
+        "energy": energy_metrics,
+    }

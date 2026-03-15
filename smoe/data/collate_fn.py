@@ -1,8 +1,131 @@
+from __future__ import annotations
 from typing import Any, Mapping
 
 import numpy as np
 import torch
 import torch.nn.utils.rnn as rnn_utils
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional
+
+@dataclass
+class FaultTolerantMultipleChoiceCollator:
+    pad_token_id: int
+    label_pad_token_id: int = -100
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """
+        Expects each feature to have:
+          input_ids: List[List[int]]      # num_choices x seq_len_i
+          attention_mask: List[List[int]]
+          labels: List[List[int]]
+          correct_idx: int
+        """
+        batch_size = len(features)
+        num_choices = len(features[0]["input_ids"])
+
+        max_len = 0
+        for feat in features:
+            for choice_ids in feat["input_ids"]:
+                max_len = max(max_len, len(choice_ids))
+
+        batch_input_ids = []
+        batch_attention_mask = []
+        batch_labels = []
+        batch_correct_idx = []
+
+        for feat in features:
+            ex_input_ids = []
+            ex_attention_mask = []
+            ex_labels = []
+
+            for ids, mask, labels in zip(
+                feat["input_ids"],
+                feat["attention_mask"],
+                feat["labels"],
+            ):
+                pad_len = max_len - len(ids)
+
+                ex_input_ids.append(ids + [self.pad_token_id] * pad_len)
+                ex_attention_mask.append(mask + [0] * pad_len)
+                ex_labels.append(labels + [self.label_pad_token_id] * pad_len)
+
+            batch_input_ids.append(ex_input_ids)
+            batch_attention_mask.append(ex_attention_mask)
+            batch_labels.append(ex_labels)
+            batch_correct_idx.append(feat["correct_idx"])
+
+        return {
+            "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),           # [B, C, L]
+            "attention_mask": torch.tensor(batch_attention_mask, dtype=torch.long), # [B, C, L]
+            "labels": torch.tensor(batch_labels, dtype=torch.long),                 # [B, C, L]
+            "correct_idx": torch.tensor(batch_correct_idx, dtype=torch.long),       # [B]
+        }
+
+@dataclass
+class FaultTolerantCausalLMCollator:
+    pad_token_id: int
+    label_pad_id: int = -100
+    padding_position: str = "right"  # "left" if you really want
+
+    def __call__(self, features: List[Mapping[str, Any]]) -> Dict[str, torch.Tensor]:
+        # unwrap objects
+        if not isinstance(features[0], Mapping):
+            features = [vars(f) for f in features]
+
+        # Convert to tensors (1D) first
+        input_ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
+
+        # attention_mask optional; if missing, create it
+        if "attention_mask" in features[0] and features[0]["attention_mask"] is not None:
+            attention_mask = [
+                torch.tensor(f["attention_mask"], dtype=torch.long) for f in features
+            ]
+        else:
+            attention_mask = [torch.ones_like(x) for x in input_ids]
+
+        # labels optional; if missing, default to input_ids (standard causal LM)
+        if "labels" in features[0] and features[0]["labels"] is not None:
+            labels = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
+        else:
+            labels = [x.clone() for x in input_ids]
+
+        # Pad
+        if self.padding_position == "right":
+            input_ids = rnn_utils.pad_sequence(
+                input_ids, batch_first=True, padding_value=self.pad_token_id
+            )
+            attention_mask = rnn_utils.pad_sequence(
+                attention_mask, batch_first=True, padding_value=0
+            )
+            labels = rnn_utils.pad_sequence(
+                labels, batch_first=True, padding_value=self.label_pad_id
+            )
+        elif self.padding_position == "left":
+            # left pad by reversing then padding then reversing back
+            input_ids = [torch.flip(x, dims=[0]) for x in input_ids]
+            attention_mask = [torch.flip(x, dims=[0]) for x in attention_mask]
+            labels = [torch.flip(x, dims=[0]) for x in labels]
+
+            input_ids = torch.flip(
+                rnn_utils.pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id),
+                dims=[1],
+            )
+            attention_mask = torch.flip(
+                rnn_utils.pad_sequence(attention_mask, batch_first=True, padding_value=0),
+                dims=[1],
+            )
+            labels = torch.flip(
+                rnn_utils.pad_sequence(labels, batch_first=True, padding_value=self.label_pad_id),
+                dims=[1],
+            )
+        else:
+            raise ValueError("padding_position must be 'left' or 'right'")
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
 
 def fault_tolerance_data_collator(features: list) -> dict[str, Any]:

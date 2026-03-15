@@ -8,7 +8,7 @@ HF_DATASET = "MBZUAI-LLM/SlimPajama-627B-DC"  # already split-by-source metadata
 SPLIT = "train"
 
 OUT_ROOT = "data/redpajama"
-MAX_DOCS_TOTAL = 200_000          # start small (fast). Increase later.
+MAX_DOCS_TOTAL = 1_000_000          # start small (fast). Increase later.
 SHARD_SIZE = 10_000               # docs per jsonl shard
 
 # map setname -> folder names that your prob_map expects

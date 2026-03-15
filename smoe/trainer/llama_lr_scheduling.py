@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any, Dict, Union
 
 from packaging import version
+import torch.nn.functional as F
 
 # Integrations must be imported before ML frameworks:
 # isort: off
 from transformers.integrations import hp_params, is_fairscale_available
+from smoe.modules.lora.lora_gate import LoRALinear
 
 # isort: on
 
@@ -141,7 +143,28 @@ def _get_cosine_schedule_with_warmup_lr_lambda(
         final_lr_portion,
         0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
     )
+    
+def set_router_lora_enabled(model, enabled: bool):
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            # Common patterns: either a flag or scaling
+            if hasattr(m, "disable_adapters"):   # if implemented
+                m.disable_adapters = not enabled
+            elif hasattr(m, "lora_enabled"):
+                m.lora_enabled = enabled
+            elif hasattr(m, "scaling"):
+                m.scaling = m.scaling if enabled else 0.0
+            else:
+                # fallback: keep a backup scale once
+                if not hasattr(m, "_scale_backup"):
+                    m._scale_backup = 1.0
+                m._scale_backup = getattr(m, "_scale_backup", 1.0)
+                m.scaling = m._scale_backup if enabled else 0.0
 
+def iter_gate_modules(model):
+    for m in model.modules():
+        if hasattr(m, "_cache_router_logits") and hasattr(m, "_cache_topk_idx"):
+            yield m
 
 @dataclass
 class EnhancedTrainerState(TrainerState):
@@ -167,7 +190,7 @@ class LlamaLrSchedulingTrainer(Trainer):
         self._router_layers = 0
         self._router_kmean_acc = None
         
-    def _register_router_hooks(self, model_to_hook: nn.Module):
+    def _register_router_hooks(self, model_to_hook):
         # remove existing hooks
         for h in getattr(self, "_router_hooks", []):
             try:
@@ -180,38 +203,33 @@ class LlamaLrSchedulingTrainer(Trainer):
 
         def hook_fn(module, inp, out):
             if not isinstance(out, dict):
-                if not getattr(self, "_printed_out_type", False):
-                    logger.warning(f"[SANITY] Hook out type is {type(out)} (not dict).")
-                    self._printed_out_type = True
                 return
             p = out.get("probs_full", None)
             if p is None:
                 return
-            if getattr(self, "_printed_p_grad", False) is False:
-                if p is not None:
-                    logger.warning(f"[SANITY] probs_full.requires_grad={p.requires_grad}, "
-                                f"grad_fn={type(p.grad_fn).__name__ if p.grad_fn is not None else None}, "
-                                f"dtype={p.dtype}, shape={tuple(p.shape)}")
-                self._printed_p_grad = True
 
+            # init accumulators as tensors on correct device/dtype
             if self._router_loss_acc is None:
                 self._router_loss_acc = p.new_zeros(())
                 self._router_entropy_acc = p.new_zeros(())
                 self._router_kmean_acc = p.new_zeros(())
                 self._router_layers = 0
 
-            loss_layer = out["balance_loss"]
-            self._router_loss_acc += loss_layer
+            # balance loss stabilizer
+            bal = out.get("balance_loss", None)
+            if bal is None:
+                bal = p.new_zeros(())
+            self._router_loss_acc = self._router_loss_acc + bal
 
+            # entropy (logging)
             p_safe = p.clamp_min(1e-12)
-            ent_layer = (-(p_safe * p_safe.log()).sum(dim=1)).mean()
-            self._router_entropy_acc = self._router_entropy_acc + ent_layer
-            
+            ent = (-(p_safe * p_safe.log()).sum(dim=1)).mean()
+            self._router_entropy_acc = self._router_entropy_acc + ent
+
+            # mean_k (logging only)
             k_vec = out.get("k_vec", None)
-            if k_vec is None:
-                raise RuntimeError("DynamicTopGate output missing k_vec; cannot compute mean_k.")
-            k_layer = k_vec.float().mean()
-            self._router_kmean_acc = self._router_kmean_acc + k_layer
+            if k_vec is not None:
+                self._router_kmean_acc = self._router_kmean_acc + k_vec.float().mean()
 
             self._router_layers += 1
 
@@ -219,7 +237,7 @@ class LlamaLrSchedulingTrainer(Trainer):
             if m.__class__.__name__ == "DynamicTopGate":
                 self._router_hooks.append(m.register_forward_hook(hook_fn))
 
-        logger.info(f"Registered {len(self._router_hooks)} DynamicTopGate hooks on executing model.")
+        logger.info(f"Registered {len(self._router_hooks)} DynamicTopGate hooks.")
 
     def _top2_regularizer(self, p: torch.Tensor) -> torch.Tensor:
         """
@@ -241,65 +259,248 @@ class LlamaLrSchedulingTrainer(Trainer):
         else:
             # default: l1
             return (top2_mass - target).abs().mean()
-
         
+    # # ARC-C Specific Training
+    # def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    #     """
+    #     Expected inputs:
+    #     input_ids:      [B, C, L]
+    #     attention_mask: [B, C, L]
+    #     labels:         [B, C, L]   (-100 on prompt, token ids on answer suffix)
+    #     correct_idx:    [B]         integer in [0, C-1]
+    #     """
+
+    #     input_ids = inputs["input_ids"]
+    #     attention_mask = inputs["attention_mask"]
+    #     labels = inputs["labels"]
+    #     correct_idx = inputs["correct_idx"]
+
+    #     B, C, L = input_ids.shape
+
+    #     # Flatten choices so model sees a normal batch
+    #     flat_input_ids = input_ids.view(B * C, L)
+    #     flat_attention_mask = attention_mask.view(B * C, L)
+    #     flat_labels = labels.view(B * C, L)
+
+    #     model_inputs = {
+    #         "input_ids": flat_input_ids,
+    #         "attention_mask": flat_attention_mask,
+    #         "labels": flat_labels,
+    #     }
+
+    #     # Anchor only on supervised suffix tokens
+    #     anchor_mask = (flat_labels != -100).view(-1)
+
+    #     # ===== 1) base forward (LoRA disabled) =====
+    #     set_router_lora_enabled(model, False)
+
+    #     for g in iter_gate_modules(model):
+    #         g.clear_cache()
+
+    #     with torch.no_grad():
+    #         base_outputs = model(
+    #             input_ids=flat_input_ids,
+    #             attention_mask=flat_attention_mask,
+    #             use_cache=False,
+    #         )
+
+    #     base_gate_logits = []
+    #     base_gate_topk = []
+    #     for g in iter_gate_modules(model):
+    #         base_gate_logits.append(
+    #             g._cache_router_logits.view(-1, g._cache_router_logits.size(-1))
+    #         )
+    #         base_gate_topk.append(
+    #             g._cache_topk_idx.view(-1, g._cache_topk_idx.size(-1))
+    #         )
+
+    #     # ===== 2) LoRA forward (LoRA enabled) =====
+    #     set_router_lora_enabled(model, True)
+
+    #     for g in iter_gate_modules(model):
+    #         g.clear_cache()
+
+    #     outputs = model(
+    #         input_ids=flat_input_ids,
+    #         attention_mask=flat_attention_mask,
+    #         use_cache=False,
+    #     )
+
+    #     logits = outputs.logits  # [B*C, L, V]
+
+    #     lora_gate_logits = []
+    #     lora_gate_topk = []
+    #     for g in iter_gate_modules(model):
+    #         lora_gate_logits.append(
+    #             g._cache_router_logits.view(-1, g._cache_router_logits.size(-1))
+    #         )
+    #         lora_gate_topk.append(
+    #             g._cache_topk_idx.view(-1, g._cache_topk_idx.size(-1))
+    #         )
+
+    #     # ===== 3) MCQ scoring loss =====
+    #     choice_scores = self._compute_choice_scores_from_labels(
+    #         logits=logits,
+    #         labels=flat_labels,
+    #     )  # [B*C]
+
+    #     choice_scores = choice_scores.view(B, C)  # [B, C]
+
+    #     # Higher score = better choice
+    #     mcq_loss = F.cross_entropy(choice_scores, correct_idx)
+
+    #     # ===== 4) router anchor regularizers =====
+    #     kl_terms = []
+    #     ov_terms = []
+
+    #     for bl, ll, bt, lt in zip(base_gate_logits, lora_gate_logits, base_gate_topk, lora_gate_topk):
+    #         mask = anchor_mask
+    #         if mask is not None and mask.numel() != bl.size(0):
+    #             mask = None
+
+    #         kl_terms.append(self.router_kl_anchor(bl, ll, mask=mask, temperature=1.0))
+    #         ov_terms.append(self.topk_overlap_loss(bt, lt, mask=mask))
+
+    #     kl_loss = (
+    #         torch.stack(kl_terms).mean()
+    #         if kl_terms else torch.tensor(0.0, device=mcq_loss.device)
+    #     )
+    #     ov_loss = (
+    #         torch.stack(ov_terms).mean()
+    #         if ov_terms else torch.tensor(0.0, device=mcq_loss.device)
+    #     )
+
+    #     lambda_kl = getattr(self.args, "router_anchor_kl", 0.05)
+    #     lambda_ov = getattr(self.args, "router_anchor_overlap", 0.10)
+
+    #     loss = mcq_loss + lambda_kl * kl_loss + lambda_ov * ov_loss
+        
+    #     if not hasattr(self, "_printed_arc_debug"):
+    #         self._printed_arc_debug = True
+    #         print("input_ids:", input_ids.shape)         # should be [B, C, L]
+    #         print("labels:", labels.shape)               # should be [B, C, L]
+    #         print("correct_idx:", correct_idx)           # [B]
+            
+    #     if not hasattr(self, "_printed_arc_scores"):
+    #         self._printed_arc_scores = True
+    #         print("choice_scores shape:", choice_scores.shape)   # should be [B, C]
+    #         print("choice_scores:", choice_scores[:2].detach().cpu())
+    #         print("gold:", correct_idx[:2].detach().cpu())
+    #         print("pred:", choice_scores[:2].argmax(dim=-1).detach().cpu())
+
+    #     if return_outputs:
+    #         outputs.mcq_loss = mcq_loss.detach()
+    #         outputs.router_anchor_kl = kl_loss.detach()
+    #         outputs.router_anchor_overlap = ov_loss.detach()
+    #         outputs.choice_scores = choice_scores.detach()
+    #         return loss, outputs
+
+    #     return loss
+        
+    # Lambada Specific Training
+    # def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    #     # ===== choose which tokens to anchor on =====
+    #     labels = inputs.get("labels", None)
+    #     anchor_mask = None
+    #     if labels is not None:
+    #         # anchor only on supervised tokens (e.g. last 64 tokens if you changed labels)
+    #         anchor_mask = (labels.view(-1) != -100)
+
+    #     # ===== 1) base forward (LoRA disabled) =====
+    #     set_router_lora_enabled(model, False)
+
+    #     # clear caches
+    #     for g in iter_gate_modules(model):
+    #         g.clear_cache()
+
+    #     with torch.no_grad():
+    #         _ = model(**inputs)
+
+    #     base_gate_logits = []
+    #     base_gate_topk = []
+    #     for g in iter_gate_modules(model):
+    #         # ensure shape [T, E] / [T, K]
+    #         base_gate_logits.append(g._cache_router_logits.view(-1, g._cache_router_logits.size(-1)))
+    #         base_gate_topk.append(g._cache_topk_idx.view(-1, g._cache_topk_idx.size(-1)))
+
+    #     # ===== 2) lora forward (LoRA enabled) =====
+    #     set_router_lora_enabled(model, True)
+
+    #     for g in iter_gate_modules(model):
+    #         g.clear_cache()
+
+    #     outputs = model(**inputs)
+    #     lm_loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+
+    #     lora_gate_logits = []
+    #     lora_gate_topk = []
+    #     for g in iter_gate_modules(model):
+    #         lora_gate_logits.append(g._cache_router_logits.view(-1, g._cache_router_logits.size(-1)))
+    #         lora_gate_topk.append(g._cache_topk_idx.view(-1, g._cache_topk_idx.size(-1)))
+
+    #     # ===== 3) anchor regularizers =====
+    #     # aggregate across all gate layers (mean of means)
+    #     kl_terms = []
+    #     ov_terms = []
+
+    #     for bl, ll, bt, lt in zip(base_gate_logits, lora_gate_logits, base_gate_topk, lora_gate_topk):
+    #         # anchor_mask aligns to tokens. if your gate caches are per-token per-layer, this works.
+    #         mask = anchor_mask
+    #         if mask is not None and mask.numel() != bl.size(0):
+    #             # fallback: don't mask if shapes don't align
+    #             mask = None
+
+    #         kl_terms.append(self.router_kl_anchor(bl, ll, mask=mask, temperature=1.0))
+    #         ov_terms.append(self.topk_overlap_loss(bt, lt, mask=mask))
+
+    #     kl_loss = torch.stack(kl_terms).mean() if kl_terms else torch.tensor(0.0, device=lm_loss.device)
+    #     ov_loss = torch.stack(ov_terms).mean() if ov_terms else torch.tensor(0.0, device=lm_loss.device)
+
+    #     # tune these
+    #     lambda_kl = getattr(self.args, "router_anchor_kl", 0.05)
+    #     lambda_ov = getattr(self.args, "router_anchor_overlap", 0.10)
+
+    #     loss = lm_loss + lambda_kl * kl_loss + lambda_ov * ov_loss
+
+    #     if return_outputs:
+    #         # (optional) attach for logging
+    #         outputs.router_anchor_kl = kl_loss.detach()
+    #         outputs.router_anchor_overlap = ov_loss.detach()
+    #         return loss, outputs
+    #     return loss
+    
+    # Causal LM Training with router regularization
     def compute_loss(self, model, inputs, return_outputs=False):
-        self._router_kmean_acc = None
-        self._router_loss_acc = None
-        self._router_entropy_acc = None
+        # reset accumulators for this forward
+        self._router_loss_acc = None          # will hold balance_loss sum (tensor scalar)
+        self._router_entropy_acc = None       # tensor scalar
+        self._router_kmean_acc = None         # tensor scalar (logging only)
         self._router_layers = 0
 
-        outputs = model(**inputs)
-        
+        outputs = model(**inputs)  # outputs.loss is LM loss if labels exist
+
         if self._router_layers == 0:
-            raise RuntimeError(
-                "Router hooks did not fire (router_layers=0). "
-                "This means you are not collecting probs_full, so router_loss is constant and loss has no grad."
-            )
-        
-        if self._router_layers > 0:
-            router_loss = self._router_loss_acc / self._router_layers
-            router_entropy = self._router_entropy_acc / self._router_layers
-        else:
-            router_loss = outputs.loss.new_zeros(())
-            router_entropy = outputs.loss.new_zeros(())
+            raise RuntimeError("Router hooks did not fire (router_layers=0).")
 
-        lam = float(getattr(self.args, "router_loss_weight", 1e-3))
+        # average across layers
+        router_balance = self._router_loss_acc / self._router_layers
+        router_entropy = self._router_entropy_acc / self._router_layers
         mean_k = self._router_kmean_acc / self._router_layers
-        k_target = float(getattr(self.args, "router_target_mean_k", 2.3))
-        lam_k = float(getattr(self.args, "router_kmatch_weight", 0.1))
-        kmatch = (mean_k - mean_k.new_tensor(k_target)).pow(2)
-        loss = outputs.loss + lam * router_loss + lam_k * kmatch
-        
-        if self.state.global_step < 3 and self.is_local_process_zero():
-            logger.warning(f"[SANITY] mean_k.requires_grad={mean_k.requires_grad}, kmatch.requires_grad={kmatch.requires_grad}")
 
+        # weights
+        lam_balance = float(getattr(self.args, "router_balance_weight", 1e-4))  
 
-        # logging fields must be tensors
-        outputs.router_loss = router_loss.detach()
+        # LM loss (main objective)
+        loss = outputs.loss + lam_balance * router_balance
+
+        # attach for logging (no grads)
+        outputs.router_balance = router_balance.detach()
         outputs.router_entropy = router_entropy.detach()
         outputs.router_mean_k = mean_k.detach()
-        outputs.router_kmatch = kmatch.detach()
-
-        if self.state.global_step < 3 and self.is_local_process_zero():
-            logger.warning(
-                f"[SANITY] layers={self._router_layers} "
-                f"router_loss_requires_grad={(router_loss.requires_grad if self._router_layers>0 else None)} "
-                f"lm_loss_requires_grad={outputs.loss.requires_grad}"
-            )
-
-            # Check a single LoRA param
-            for n, p in unwrap_model(model).named_parameters():
-                if "lora_A" in n or "lora_B" in n:
-                    logger.warning(f"[SANITY] trainable param example: {n} requires_grad={p.requires_grad} "
-                                f"grad_is_None={(p.grad is None)} shape={tuple(p.shape)}")
-                    break
 
         if not loss.requires_grad:
-            raise RuntimeError(
-                "Loss has no grad. Likely you detached router probs/loss or LM loss has no trainable path."
-            )
-        
+            raise RuntimeError("Loss has no grad. Check LoRA params require_grad and labels are present.")
+
         return (loss, outputs) if return_outputs else loss
 
 
@@ -470,43 +671,56 @@ class LlamaLrSchedulingTrainer(Trainer):
         router_loss: torch.FloatTensor = None,
         router_entropy: torch.FloatTensor = None,
     ):
+        def _stats(x: torch.Tensor):
+            x = x.detach().float()
+            mean = x.mean().item()
+            std = x.std(unbiased=False).item()
+            mx = x.max().item()
+            return mean, std, mx
+
         if self.control.should_log:
             if is_torch_tpu_available():
                 xm.mark_step()
 
             logs: Dict[str, float] = {}
-
-            # all_gather + mean() to get average loss over all processes
             tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
-
-            # reset tr_loss to zero
             tr_loss -= tr_loss
 
-            logs["loss"] = round(
-                tr_loss_scalar
-                / (self.state.global_step - self._globalstep_last_logged),
-                4,
-            )
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
             logs["learning_rate"] = self._get_learning_rate()
-            logs["num_dropped_tokens"] = [x.item() for x in num_dropped_tokens]
-            logs["gate_load"] = [x.detach().cpu().tolist() for x in gate_load]
-            logs["gate_importance"] = [
-                x.detach().cpu().tolist() for x in gate_importance
-            ]
-            logs["balance_loss"] = balance_loss.item()
             logs["tot_consumed_tokens"] = self.state.tot_consumed_tokens
-            logs["prob_map"] = self.train_dataset.prob_map
-            
+
+            # ✅ keep these small
             if router_loss is not None:
                 logs["router_loss"] = router_loss.item()
             if router_entropy is not None:
                 logs["router_entropy"] = router_entropy.item()
+            if balance_loss is not None:
+                logs["balance_loss"] = balance_loss.item()
+
+            # ✅ summarize instead of dumping arrays
+            if num_dropped_tokens is not None:
+                # tuple[int] or tuple[tensor]; make it small
+                logs["num_dropped_tokens_sum"] = float(sum(int(x) for x in num_dropped_tokens))
+
+            if gate_load is not None:
+                # gate_load is tuple[layer_tensor], log aggregate stats across layers
+                gl = torch.stack([x.detach().float().mean() for x in gate_load])
+                logs["gate_load_layer_mean_mean"] = gl.mean().item()
+                logs["gate_load_layer_mean_max"] = gl.max().item()
+
+            if gate_importance is not None:
+                gi = torch.stack([x.detach().float().mean() for x in gate_importance])
+                logs["gate_importance_layer_mean_mean"] = gi.mean().item()
+                logs["gate_importance_layer_mean_max"] = gi.max().item()
 
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
 
-            self.log(logs)
+            # ✅ rank-0 only
+            if self.is_world_process_zero():
+                self.log(logs)
 
         metrics = None
         if self.control.should_evaluate:
@@ -658,6 +872,59 @@ class LlamaLrSchedulingTrainer(Trainer):
             dataloader_params["worker_init_fn"] = seed_worker
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
+    
+    def router_kl_anchor(self, base_logits, lora_logits, mask=None, temperature=1.0):
+        """
+        base_logits, lora_logits: [T, E]
+        mask: [T] bool, optional (only apply on selected tokens)
+        """
+        p = F.softmax(base_logits / temperature, dim=-1)
+        q = F.log_softmax(lora_logits / temperature, dim=-1)
+        kl = F.kl_div(q, p, reduction="none").sum(dim=-1)  # [T]
+        if mask is not None:
+            kl = kl[mask]
+        return kl.mean()
+
+    def topk_overlap_loss(self, base_topk, lora_topk, mask=None):
+        """
+        base_topk, lora_topk: [T, K] long
+        Loss = 1 - (|intersection|/K) averaged over T
+        """
+        # intersection count per token
+        # For K=4 this is cheap enough to do with broadcasting
+        inter = (base_topk.unsqueeze(-1) == lora_topk.unsqueeze(-2)).any(dim=-1).float().sum(dim=-1)  # [T]
+        K = base_topk.size(-1)
+        overlap = inter / K  # [T]
+        if mask is not None:
+            overlap = overlap[mask]
+        return (1.0 - overlap).mean()
+    
+    def _compute_choice_scores_from_labels(self, logits, labels):
+        """
+        logits: [N, L, V]
+        labels: [N, L] with -100 on prompt tokens and token ids on answer suffix
+
+        Returns:
+        scores: [N] = sum log p(correct suffix tokens)
+        """
+        # Shift for causal LM
+        shift_logits = logits[:, :-1, :].contiguous()   # [N, L-1, V]
+        shift_labels = labels[:, 1:].contiguous()       # [N, L-1]
+
+        log_probs = F.log_softmax(shift_logits, dim=-1)  # [N, L-1, V]
+
+        valid_mask = (shift_labels != -100)              # [N, L-1]
+
+        gather_labels = shift_labels.masked_fill(~valid_mask, 0)
+        token_log_probs = log_probs.gather(
+            dim=-1,
+            index=gather_labels.unsqueeze(-1)
+        ).squeeze(-1)                                    # [N, L-1]
+
+        token_log_probs = token_log_probs * valid_mask
+        scores = token_log_probs.sum(dim=-1)             # [N]
+
+        return scores
 
     def _inner_training_loop(
         self,

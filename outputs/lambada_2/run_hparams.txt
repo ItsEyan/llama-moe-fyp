@@ -1,0 +1,41 @@
+{
+  "model": {
+    "model_type": "llama_moe",
+    "model_name_or_path": "llama-moe/LLaMA-MoE-v1-3_5B-4_16",
+    "tokenizer_name_or_path": "llama-moe/LLaMA-MoE-v1-3_5B-4_16"
+  },
+  "data": {
+    "dataset_dir": null,
+    "block_size": 1024,
+    "max_train_samples": 20000,
+    "prob_map": {
+      "en_arxiv": 1.0
+    }
+  },
+  "train": {
+    "max_steps": 1000,
+    "learning_rate": 5e-05,
+    "warmup_steps": 200,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "fp16": true,
+    "bf16": false,
+    "tf32": null,
+    "gradient_checkpointing": false,
+    "logging_steps": 10,
+    "save_steps": 200,
+    "seed": 42,
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.05,
+    "router_loss_weight": 0.0001,
+    "router_top2_target": 0.9,
+    "router_top2_kind": "l1",
+    "router_top2_margin": 0.05
+  },
+  "output_dir": "outputs/lambada_2",
+  "resume": {
+    "resume_from_checkpoint": null,
+    "last_checkpoint_detected": null
+  }
+}

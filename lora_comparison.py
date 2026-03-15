@@ -25,6 +25,7 @@ import os
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Any, List
 
+from sympy import comp, pretty_print
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -204,33 +205,24 @@ def load_router_adapter(model: nn.Module, adapter_path: str, *, r=8, alpha=16, d
 # ----------------------------
 # Evaluation wrapper
 # ----------------------------
-def run_eval_with_stats(
+def run_single_eval_with_stats(
     model: nn.Module,
-    tokenizer,
-    device: str,
-    dataset_names: List[str],
-    evaluate_fn,
+    eval_fn,
 ) -> Dict[str, Any]:
-    """
-    evaluate_fn should be your evaluate(datasets) function.
-    If it returns metrics, we'll forward them; otherwise metrics=None.
-    """
     collector = GateStatsCollector(model)
     collector.attach()
     collector.reset()
 
-    # run evaluation
     with torch.no_grad():
-        maybe_metrics = evaluate_fn(dataset_names)  # your evaluate() currently doesn't return; that's okay.
+        maybe_metrics = eval_fn()
 
     stats = collector.summarize()
     collector.detach()
 
-    out = {
+    return {
         "router_stats": asdict(stats),
         "metrics": maybe_metrics if maybe_metrics is not None else None,
     }
-    return out
 
 
 # ----------------------------
@@ -248,7 +240,9 @@ def main():
         help="If set, evaluate both BASE and LoRA models. "
             "Default: only LoRA (if adapter provided)."
     )
+    parser.add_argument("--flops", action="store_true")
     args = parser.parse_args()
+    collect_flops = args.flops
 
     device = args.device
     model_dir = args.model
@@ -263,47 +257,67 @@ def main():
         model_dir, torch_dtype=torch.bfloat16, trust_remote_code=True
     ).to(device).eval()
 
-    def evaluate(datasets):
-        collect_flops = False
-        # NOTE: your eval_* functions currently print metrics and may return dicts.
-        # If they return dicts, you can aggregate and return them here.
+    def evaluate_per_dataset(model_ref, datasets, collect_flops=False):
         results = {}
+
         if "boolq" in datasets:
-            results["boolq"] = eval_boolq(
-                base_model_ref, tokenizer, device,
-                max_eval=1024, batch_size=8, collect_flops=collect_flops
+            results["boolq"] = run_single_eval_with_stats(
+                model_ref,
+                lambda: eval_boolq(
+                    model_ref, tokenizer, device,
+                    max_eval=1024, batch_size=8, collect_flops=collect_flops
+                )
             )
+
         if "piqa" in datasets:
-            results["piqa"] = eval_piqa(
-                base_model_ref, tokenizer, device,
-                max_eval=2000, batch_size=32, collect_flops=collect_flops
+            results["piqa"] = run_single_eval_with_stats(
+                model_ref,
+                lambda: eval_piqa(
+                    model_ref, tokenizer, device,
+                    max_eval=2000, batch_size=32, collect_flops=collect_flops
+                )
             )
+
         if "hellaswag" in datasets:
-            results["hellaswag"] = eval_hellaswag(
-                base_model_ref, tokenizer, device,
-                max_eval=2000, batch_size=8, collect_flops=collect_flops
+            results["hellaswag"] = run_single_eval_with_stats(
+                model_ref,
+                lambda: eval_hellaswag(
+                    model_ref, tokenizer, device,
+                    max_eval=2000, batch_size=8, collect_flops=collect_flops
+                )
             )
+
         if "arc" in datasets:
-            results["arc"] = eval_arc(
-                base_model_ref, tokenizer, device,
-                subset="ARC-Challenge", max_eval=1000, batch_size=8, collect_flops=collect_flops
+            results["arc"] = run_single_eval_with_stats(
+                model_ref,
+                lambda: eval_arc(
+                    model_ref, tokenizer, device,
+                    subset="ARC-Challenge", max_eval=1000, batch_size=8, collect_flops=collect_flops
+                )
             )
+
         if "lambada" in datasets:
-            results["lambada"] = eval_lambada(
-                base_model_ref, tokenizer, device,
-                max_eval=5000, batch_size=32, collect_flops=collect_flops
+            results["lambada"] = run_single_eval_with_stats(
+                model_ref,
+                lambda: eval_lambada(
+                    model_ref, tokenizer, device,
+                    max_eval=5000, batch_size=32, collect_flops=collect_flops
+                )
             )
+
         return results
 
     def pretty_print(label: str, payload: Dict[str, Any]):
         print(f"\n===== {label} =====")
-        rs = payload["router_stats"]
-        print(json.dumps(rs, indent=2))
-        if payload["metrics"] is not None:
-            print("\nmetrics:")
-            print(json.dumps(payload["metrics"], indent=2))
+        for ds_name, ds_payload in payload.items():
+            print(f"\n--- {ds_name} ---")
+            rs = ds_payload["router_stats"]
+            print(json.dumps(rs, indent=2))
+            if ds_payload["metrics"] is not None:
+                print("\nmetrics:")
+                print(json.dumps(ds_payload["metrics"], indent=2))
 
-        # ============================================================
+    # ============================================================
     # Evaluation logic
     # ============================================================
 
@@ -313,9 +327,7 @@ def main():
         # --------------------------------------------------------
         print("\nRunning BASE model...")
         base_model_ref = base_model
-        base_out = run_eval_with_stats(
-            base_model_ref, tokenizer, device, datasets_list, evaluate
-        )
+        base_out = evaluate_per_dataset(base_model_ref, datasets_list, collect_flops=collect_flops)
         pretty_print("BASE", base_out)
 
         # --------------------------------------------------------
@@ -333,37 +345,42 @@ def main():
         )
 
         base_model_ref = lora_model
-        lora_out = run_eval_with_stats(
-            base_model_ref, tokenizer, device, datasets_list, evaluate
-        )
+        lora_out = evaluate_per_dataset(base_model_ref, datasets_list, collect_flops=collect_flops    )
         pretty_print("LORA", lora_out)
 
         # --------------------------------------------------------
         # Comparison summary
         # --------------------------------------------------------
-        b = base_out["router_stats"]
-        l = lora_out["router_stats"]
-
-        def _get(x, k):
-            v = x.get(k, None)
-            return float(v) if (v is not None and v == v) else None
-
-        comp = {
-            "mean_k": {
-                "base": _get(b, "mean_k"),
-                "lora": _get(l, "mean_k"),
-            },
-            "mean_entropy_full": {
-                "base": _get(b, "mean_entropy_full"),
-                "lora": _get(l, "mean_entropy_full"),
-            },
-            "mean_entropy_selected": {
-                "base": _get(b, "mean_entropy_selected"),
-                "lora": _get(l, "mean_entropy_selected"),
-            },
-        }
 
         print("\n===== COMPARISON =====")
+        comp = {}
+
+        for ds in datasets_list:
+            if ds not in base_out or ds not in lora_out:
+                continue
+
+            b = base_out[ds]["router_stats"]
+            l = lora_out[ds]["router_stats"]
+
+            def _get(x, k):
+                v = x.get(k, None)
+                return float(v) if (v is not None and v == v) else None
+
+            comp[ds] = {
+                "mean_k": {
+                    "base": _get(b, "mean_k"),
+                    "lora": _get(l, "mean_k"),
+                },
+                "mean_entropy_full": {
+                    "base": _get(b, "mean_entropy_full"),
+                    "lora": _get(l, "mean_entropy_full"),
+                },
+                "mean_entropy_selected": {
+                    "base": _get(b, "mean_entropy_selected"),
+                    "lora": _get(l, "mean_entropy_selected"),
+                },
+            }
+
         print(json.dumps(comp, indent=2))
 
     else:
@@ -377,9 +394,7 @@ def main():
         lora_model = load_router_adapter(base_model, args.adapter)
 
         base_model_ref = lora_model
-        lora_out = run_eval_with_stats(
-            base_model_ref, tokenizer, device, datasets_list, evaluate
-        )
+        lora_out = evaluate_per_dataset(base_model_ref, datasets_list, collect_flops=collect_flops)
         pretty_print("LORA", lora_out)
 
 if __name__ == "__main__":
